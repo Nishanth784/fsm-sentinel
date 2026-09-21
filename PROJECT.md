@@ -3,9 +3,9 @@ fsm_analyzer.py: VALIDATED (analysis + fix engine)
 test_fsm_analyzer.py: VALIDATED (7/7 tests passing)
 axi_master.v: REAL PRODUCTION FILE (replaces the synthetic fixture Claude Code originally wrote; now contains the real testbench, axi_master, and axi4_slave modules)
 axi_master_fixed.v: GENERATED OUTPUT — produced by `python fsm_analyzer.py axi_master.v --fix`; not hand-maintained, regenerate via the tool
-Fix engine: BUILT — generate_fix / show_diff / apply_fix / fix_and_verify added; verified end-to-end (wdata_last deadlock -> 0 warnings)
+Fix engine: BUILT — generate_fix / show_diff / apply_fix / fix_and_verify added; provider order Groq -> Anthropic -> template fallback; verified end-to-end via the template fallback (wdata_last deadlock -> 0 warnings); neither live provider reachable/validated from this sandbox (see FIX ENGINE section)
 Last updated by: Claude Code
-Last updated at: 2026-09-21T10:57:49Z
+Last updated at: 2026-09-21T11:10:46Z
 
 ## ARCHITECTURE DECISIONS
 - Parser uses Python re only — no third party Verilog libraries
@@ -34,20 +34,31 @@ Last updated at: 2026-09-21T10:57:49Z
   suite.
 
 ## FIX ENGINE (added on top of the analyzer)
-- generate_fix(state_name, condition, fsm_source) — tries the live
-  Anthropic API (model "claude-sonnet-5") first when ANTHROPIC_API_KEY
-  is set in the environment. If the key is missing, the 'anthropic'
-  package isn't installed, or the API call itself raises, it falls
-  back to a deterministic template fix instead of failing the whole
-  workflow — a live demo shouldn't go down over a network blip or a
-  missing key. The fallback is always announced on stdout
-  ("[FIX ENGINE] ... using deterministic template fix") so it's never
-  mistaken for a live LLM result. NOTE: this was built and validated
-  entirely on the fallback path — no ANTHROPIC_API_KEY was available
-  in the build environment, so the live-API branch is implemented per
-  spec but has not itself been exercised end-to-end. Wire in a real
-  key and re-run `python fsm_analyzer.py axi_master.v --fix` to
-  validate that branch before the demo.
+- generate_fix(state_name, condition, fsm_source) — tries providers in
+  order: Groq first (GROQ_API_KEY, OpenAI-compatible endpoint at
+  api.groq.com, model from GROQ_MODEL env var, default
+  "llama-3.3-70b-versatile"), then Anthropic (ANTHROPIC_API_KEY, model
+  "claude-sonnet-5"), then a deterministic template fix. Each step
+  falls through to the next on a missing key, a missing package, or a
+  failed call — a live demo shouldn't go down over a network blip or a
+  missing key. Whichever path runs is always announced on stdout
+  ("[FIX ENGINE] ... using deterministic template fix" /
+  "Groq call failed (...) — trying next provider") so the fallback is
+  never mistaken for a live LLM result.
+  NOTE: **neither live provider has been validated end-to-end from the
+  build environment.** ANTHROPIC_API_KEY was never available here.
+  A GROQ_API_KEY was supplied later and wired in, but this sandbox's
+  network policy blocks outbound HTTPS to api.groq.com (proxy returns
+  403 connect_rejected — an org-level policy denial, not a bug in the
+  code) so the Groq branch immediately falls through to the template
+  fix. Both API branches are implemented per spec but only exercised
+  in this environment via the fallback path. Before the demo, run
+  `python fsm_analyzer.py axi_master.v --fix` with GROQ_API_KEY (and/or
+  ANTHROPIC_API_KEY) set from a machine that can actually reach the
+  provider, and confirm the diff quality and output.
+  Also: the Groq key that was used to smoke-test the fallthrough
+  behavior was pasted in plaintext in chat — treat it as compromised
+  and rotate it on Groq's console before relying on it for the demo.
 - The template fallback reuses this FSM's own existing "== 15" timeout
   counter pattern (picks wr_count vs rd_count by matching read/write
   hints in the state name) and inserts a matching else-if/else clause,

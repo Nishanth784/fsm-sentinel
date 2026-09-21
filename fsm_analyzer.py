@@ -460,27 +460,8 @@ def _template_fix(state_name, condition, fsm_source):
     return original_block[:inner_end_end] + insertion + original_block[inner_end_end:]
 
 
-def generate_fix(state_name, condition, fsm_source):
-    """Generate a targeted fix for one deadlocked state block.
-
-    Tries the Anthropic API first when ANTHROPIC_API_KEY is set; falls
-    back to a deterministic template fix (reusing this FSM's own '== 15'
-    timeout pattern) whenever the API isn't available or fails. The
-    fallback path is always announced on stdout so it's never confused
-    with a live LLM result.
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-    if api_key:
-        try:
-            import anthropic
-        except ImportError:
-            print(
-                "[FIX ENGINE] 'anthropic' package not installed — "
-                "using deterministic template fix (no live LLM call)."
-            )
-        else:
-            prompt = f"""You are a hardware verification expert fixing a deadlock in a Verilog FSM.
+def _build_fix_prompt(state_name, condition, fsm_source):
+    return f"""You are a hardware verification expert fixing a deadlock in a Verilog FSM.
 
 The FSM has a deadlocked state: '{state_name}'
 The only exit condition is: {condition}
@@ -500,24 +481,82 @@ Rules:
 - Use only signals already present in the FSM
 - Output only the fixed state block, nothing else, no explanation, no markdown
 """
-            try:
-                client = anthropic.Anthropic(api_key=api_key)
-                message = client.messages.create(
-                    model="claude-sonnet-5",
-                    max_tokens=1000,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return message.content[0].text.strip()
-            except Exception as exc:
-                print(
-                    f"[FIX ENGINE] LLM call failed ({exc}) — "
-                    f"using deterministic template fix."
-                )
-    else:
+
+
+def _call_groq(prompt, api_key):
+    import requests
+
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+            "temperature": 0,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _call_anthropic(prompt, api_key):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return message.content[0].text.strip()
+
+
+def generate_fix(state_name, condition, fsm_source):
+    """Generate a targeted fix for one deadlocked state block.
+
+    Provider order: Groq (GROQ_API_KEY) first, then Anthropic
+    (ANTHROPIC_API_KEY), then a deterministic template fix that reuses
+    this FSM's own existing '== 15' timeout pattern. Each step falls
+    through to the next on a missing key, a missing package, or a
+    failed call — a live demo shouldn't go down over a network blip or
+    a missing key. Whichever path is used is always announced on
+    stdout, so the fallback is never mistaken for a live LLM result.
+    """
+    prompt = _build_fix_prompt(state_name, condition, fsm_source)
+
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if groq_key:
+        try:
+            return _call_groq(prompt, groq_key)
+        except Exception as exc:
+            print(f"[FIX ENGINE] Groq call failed ({exc}) — trying next provider.")
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        try:
+            return _call_anthropic(prompt, anthropic_key)
+        except ImportError:
+            print(
+                "[FIX ENGINE] 'anthropic' package not installed — "
+                "trying next provider."
+            )
+        except Exception as exc:
+            print(f"[FIX ENGINE] Anthropic call failed ({exc}) — trying next provider.")
+
+    if not groq_key and not anthropic_key:
         print(
-            "[FIX ENGINE] ANTHROPIC_API_KEY not set — using deterministic "
-            "template fix (no live LLM call)."
+            "[FIX ENGINE] No GROQ_API_KEY or ANTHROPIC_API_KEY set — "
+            "using deterministic template fix (no live LLM call)."
         )
+    else:
+        print("[FIX ENGINE] Falling back to deterministic template fix.")
 
     fixed_block = _template_fix(state_name, condition, fsm_source)
     if fixed_block is None:
