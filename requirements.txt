@@ -1,0 +1,31 @@
+# FSM Sentinel — third-party dependencies.
+# Exact versions pinned from `pip freeze` against the environment this
+# project was built and tested in. Stdlib modules (re, os, sys,
+# difflib, tempfile, zipfile, subprocess, http.server, etc.) are not
+# listed here — they need no install.
+#
+# fastapi           — api.py: the web API itself
+# uvicorn            — runs api.py (`uvicorn api:app`); not Python-imported
+#                       by any .py file, but required for start.bat and the
+#                       README's run instructions to work at all
+# python-multipart   — required by FastAPI/Starlette at runtime to parse
+#                       the multipart file uploads every endpoint accepts
+#                       (UploadFile); not Python-imported directly either
+# httpx              — api.py: async client used for the /analyze and
+#                       /analyze/batch webhook_url POST
+# reportlab          — api.py: builds the /export/pdf report
+# requests           — fsm_analyzer.py (Groq API call inside generate_fix)
+#                       and test_fsm_analyzer.py (all the live API tests)
+# anthropic          — fsm_analyzer.py (Anthropic API call inside
+#                       generate_fix). Optional at runtime: generate_fix
+#                       falls back to a deterministic template fix if this
+#                       isn't installed or no ANTHROPIC_API_KEY is set, but
+#                       the import statement is in the code, so it's listed.
+
+fastapi==0.141.1
+uvicorn==0.53.0
+python-multipart==0.0.32
+httpx==0.28.1
+reportlab==5.0.1
+requests==2.33.1
+anthropic==1.7.0
