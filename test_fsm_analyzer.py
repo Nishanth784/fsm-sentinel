@@ -2,12 +2,17 @@
 """Automated checks for fsm_analyzer.py against axi_master.v."""
 
 import contextlib
+import http.server
 import io
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import zipfile
 
 import requests
 
@@ -15,6 +20,8 @@ from fsm_analyzer import (
     TARGET_MODULE,
     check_deadlocks,
     check_reachability,
+    classify_bug_pattern,
+    compute_confidence,
     fix_and_verify,
     get_fsm,
     parse_fsm,
@@ -237,6 +244,163 @@ def test_unreachable_fsm_file():
     )
 
 
+def test_api_batch():
+    """[TEST 15] /analyze/batch with ZIP containing axi_master.v —
+    returns 2 FSMs, 1 deadlock total. Builds the ZIP in-memory with
+    the stdlib zipfile module — no pre-existing ZIP fixture needed."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.write(FILENAME, arcname="axi_master.v")
+    buf.seek(0)
+
+    resp = requests.post(
+        f"{API_BASE}/analyze/batch",
+        files={"file": ("batch.zip", buf, "application/zip")},
+    )
+    if resp.status_code != 200:
+        return False
+    data = resp.json()
+    summary = data.get("batch_summary", {})
+    return summary.get("total_fsms_found") == 2 and summary.get("total_deadlocks") == 1
+
+
+def test_api_compare():
+    """[TEST 16] /compare axi_master.v vs axi_master_fixed.v — wdata_last
+    shows as FIXED, verdict IMPROVED. Requires axi_master_fixed.v to
+    already exist (test_fix_engine, run earlier in the suite, produces it)."""
+    if not os.path.exists("axi_master_fixed.v"):
+        return False
+    with open(FILENAME, "rb") as f1, open("axi_master_fixed.v", "rb") as f2:
+        resp = requests.post(
+            f"{API_BASE}/compare",
+            files={
+                "file_v1": ("axi_master.v", f1, "text/plain"),
+                "file_v2": ("axi_master_fixed.v", f2, "text/plain"),
+            },
+        )
+    if resp.status_code != 200:
+        return False
+    data = resp.json()
+    if data.get("verdict") != "IMPROVED":
+        return False
+    axi_master_module = next(
+        (m for m in data.get("modules", []) if m.get("module_name") == TARGET_MODULE), None
+    )
+    if axi_master_module is None:
+        return False
+    fixed_states = {c["state"] for c in axi_master_module["changes"]["fixed"]}
+    return "wdata_last" in fixed_states
+
+
+def test_confidence_axi_master():
+    """[TEST 17] axi_master parse confidence >= 85"""
+    fsms = parse_fsm(FILENAME)
+    entry = get_fsm(fsms, TARGET_MODULE)
+    if entry is None:
+        return False
+    confidence = compute_confidence(
+        entry["module_name"],
+        entry["states"],
+        entry["graph"],
+        entry.get("parser_warnings", []),
+        reset_state=entry["reset_state"],
+    )
+    return confidence >= 85
+
+
+def test_api_export_pdf():
+    """[TEST 18] /export/pdf returns a valid PDF file"""
+    with open(FILENAME, "rb") as f:
+        resp = requests.post(f"{API_BASE}/export/pdf", files={"file": (FILENAME, f, "text/plain")})
+    if resp.status_code != 200:
+        return False
+    if "application/pdf" not in resp.headers.get("content-type", ""):
+        return False
+    return resp.content.startswith(b"%PDF-")
+
+
+def test_bug_pattern_wdata_last():
+    """[TEST 19] wdata_last classified as protocol_violation_deadlock or
+    handshake_deadlock"""
+    fsms = parse_fsm(FILENAME)
+    entry = get_fsm(fsms, TARGET_MODULE)
+    if entry is None:
+        return False
+    condition = dict(check_deadlocks(entry["graph"], entry["reset_state"])).get("wdata_last")
+    if condition is None:
+        return False
+    pattern = classify_bug_pattern("wdata_last", condition, entry["graph"])["pattern"]
+    return pattern in ("protocol_violation_deadlock", "handshake_deadlock")
+
+
+def test_api_analyze_bug_pattern_field():
+    """[TEST 20] /analyze response includes bug_pattern field for all deadlocks"""
+    with open(FILENAME, "rb") as f:
+        resp = requests.post(f"{API_BASE}/analyze", files={"file": (FILENAME, f, "text/plain")})
+    if resp.status_code != 200:
+        return False
+    data = resp.json()
+    any_deadlock = False
+    for result in data.get("results", []):
+        for d in result.get("deadlocks", []):
+            any_deadlock = True
+            if "bug_pattern" not in d or not d["bug_pattern"]:
+                return False
+    return any_deadlock
+
+
+def test_webhook():
+    """[TEST 21] /analyze with webhook_url — analysis completes correctly,
+    webhook receives payload. Spins up a tiny stdlib HTTP server to act
+    as the mock webhook receiver."""
+    received = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            received.append((dict(self.headers), body))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.HTTPServer(("localhost", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        with open(FILENAME, "rb") as f:
+            resp = requests.post(
+                f"{API_BASE}/analyze",
+                params={"webhook_url": f"http://localhost:{port}/hook"},
+                files={"file": (FILENAME, f, "text/plain")},
+            )
+        if resp.status_code != 200:
+            return False
+        main_data = resp.json()
+
+        for _ in range(20):
+            if received:
+                break
+            time.sleep(0.25)
+
+        if not received:
+            return False
+
+        headers, body = received[0]
+        header_names = {k.lower() for k in headers.keys()}
+        if "x-fsm-sentinel" not in header_names:
+            return False
+
+        webhook_payload = json.loads(body)
+        return webhook_payload.get("modules_found") == main_data.get("modules_found")
+    finally:
+        server.shutdown()
+
+
 def main():
     states, reset_state, graph = load()
     unreachable = check_reachability(graph, reset_state, list(states.keys()))
@@ -311,6 +475,33 @@ def main():
             "(1 deadlock) and axi4_slave (0 deadlocks)",
             test_multi_fsm_analyze(),
         ))
+
+        results.append((
+            "[TEST 15] /analyze/batch ZIP — 2 FSMs, 1 deadlock total",
+            test_api_batch(),
+        ))
+
+        results.append((
+            "[TEST 16] /compare axi_master.v vs axi_master_fixed.v — "
+            "wdata_last FIXED, verdict IMPROVED",
+            test_api_compare(),
+        ))
+
+        results.append((
+            "[TEST 18] /export/pdf returns a valid PDF file",
+            test_api_export_pdf(),
+        ))
+
+        results.append((
+            "[TEST 20] /analyze response includes bug_pattern field for "
+            "all deadlocks",
+            test_api_analyze_bug_pattern_field(),
+        ))
+
+        results.append((
+            "[TEST 21] /analyze with webhook_url — webhook receives payload",
+            test_webhook(),
+        ))
     except RuntimeError as exc:
         for n, label in (
             (8, "/analyze returns correct JSON with wdata_last deadlock"),
@@ -318,6 +509,11 @@ def main():
             (10, "/download returns a valid fixed Verilog file"),
             (11, "/visualize returns correct node types"),
             (12, "/analyze on axi_master.v finds 2 FSMs"),
+            (15, "/analyze/batch ZIP — 2 FSMs, 1 deadlock total"),
+            (16, "/compare axi_master.v vs axi_master_fixed.v"),
+            (18, "/export/pdf returns a valid PDF file"),
+            (20, "/analyze response includes bug_pattern field"),
+            (21, "/analyze with webhook_url"),
         ):
             results.append((f"[TEST {n}] {label} ({exc})", False))
     finally:
@@ -335,6 +531,23 @@ def main():
         "unreachable, no deadlocks detected",
         test_unreachable_fsm_file(),
     ))
+
+    results.append((
+        "[TEST 17] axi_master parse confidence >= 85",
+        test_confidence_axi_master(),
+    ))
+
+    results.append((
+        "[TEST 19] wdata_last classified as protocol_violation_deadlock "
+        "or handshake_deadlock",
+        test_bug_pattern_wdata_last(),
+    ))
+
+    def _test_number(label):
+        m = re.match(r"\[TEST (\d+)\]", label)
+        return int(m.group(1)) if m else 0
+
+    results.sort(key=lambda pair: _test_number(pair[0]))
 
     all_passed = True
     for label, passed in results:

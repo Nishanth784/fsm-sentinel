@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """FastAPI wrapper around fsm_analyzer.py.
 
-Exposes /analyze, /fix, /download, and /visualize for the web UI. All
-FSM parsing, deadlock detection, severity scoring, and fix logic lives
-in fsm_analyzer.py — this file only adapts its functions to HTTP:
-saving uploads to a temp file, shaping the JSON responses, and
-handling errors gracefully. No parser or fix-engine logic is
-duplicated here.
+Exposes /analyze, /fix, /download, /visualize, /analyze/batch,
+/compare, and /export/pdf for the web UI. All FSM parsing, deadlock
+detection, severity/confidence scoring, and fix logic lives in
+fsm_analyzer.py — this file only adapts its functions to HTTP: saving
+uploads to a temp file, shaping the JSON responses, and handling
+errors gracefully. No parser or fix-engine logic is duplicated here.
 
 A single uploaded .v file can contain more than one FSM (as
 axi_master.v itself does: axi_master and axi4_slave). Every endpoint
 here reports on ALL FSM modules found in the file, not just one.
 """
 
+import datetime
+import os
 import tempfile
+import zipfile
 from pathlib import Path
+from typing import Optional
 
 import fsm_analyzer as fsm
-from fastapi import FastAPI, File, UploadFile
+import httpx
+from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+
+BATCH_ZIP_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 
 app = FastAPI(title="FSM Sentinel API")
 
@@ -46,17 +53,21 @@ def _error_response(error, detail, status_code=400):
     return JSONResponse(status_code=status_code, content={"error": error, "detail": detail})
 
 
-async def _save_upload_to_tempdir(file: UploadFile, tmpdir: str) -> str:
+async def _save_upload_to_tempdir(file: UploadFile, tmpdir: str, basename: str = "upload") -> str:
     """Save an uploaded file into a temp directory that the caller owns
     (and will clean up via `with tempfile.TemporaryDirectory()`), and
     return its path. Never writes outside that temp directory, so
-    nothing from an upload persists on disk after the request."""
+    nothing from an upload persists on disk after the request.
+
+    `basename` lets a caller save more than one upload into the same
+    tempdir without collisions (e.g. /compare's file_v1 and file_v2,
+    which would otherwise both land on "upload.v")."""
     contents = await file.read()
     if not contents:
         raise FSMError("Empty file uploaded", "The uploaded file contained no data.")
 
     suffix = Path(file.filename or "upload.v").suffix or ".v"
-    tmp_path = str(Path(tmpdir) / f"upload{suffix}")
+    tmp_path = str(Path(tmpdir) / f"{basename}{suffix}")
     with open(tmp_path, "wb") as f:
         f.write(contents)
     return tmp_path
@@ -83,31 +94,41 @@ def _parse_or_raise(filepath):
 
 
 def _deadlocks_to_json(deadlocks, graph):
-    return [
-        {
-            "state": state_name,
-            "severity": fsm.score_severity(state_name, graph),
-            "condition": condition,
-            "scenario": (
-                f"If {condition} never asserts while the FSM is in "
-                f"'{state_name}', there is no timeout or unconditional "
-                f"exit. The FSM stalls indefinitely."
-            ),
-        }
-        for state_name, condition in deadlocks
-    ]
+    result = []
+    for state_name, condition in deadlocks:
+        pattern_info = fsm.classify_bug_pattern(state_name, condition, graph)
+        result.append(
+            {
+                "state": state_name,
+                "severity": fsm.score_severity(state_name, graph),
+                "bug_pattern": pattern_info["pattern"],
+                "pattern_description": pattern_info["description"],
+                "condition": condition,
+                "scenario": (
+                    f"If {condition} never asserts while the FSM is in "
+                    f"'{state_name}', there is no timeout or unconditional "
+                    f"exit. The FSM stalls indefinitely."
+                ),
+            }
+        )
+    return result
 
 
 def _analyze_one(entry):
     states = entry["states"]
     reset_state = entry["reset_state"]
     graph = entry["graph"]
+    parser_warnings = entry.get("parser_warnings", [])
 
     unreachable = fsm.check_reachability(graph, reset_state, list(states.keys()))
     deadlocks = fsm.check_deadlocks(graph, reset_state)
+    confidence = fsm.compute_confidence(
+        entry["module_name"], states, graph, parser_warnings, reset_state=reset_state
+    )
 
     return {
         "module_name": entry["module_name"],
+        "parse_confidence": confidence,
         "states_found": len(states),
         "reset_state": reset_state,
         "reachability": {
@@ -119,8 +140,29 @@ def _analyze_one(entry):
     }
 
 
+async def post_webhook(url: str, payload: dict):
+    """Best-effort POST of an analysis result to a caller-supplied
+    webhook URL. Runs as a FastAPI background task, after the main
+    response has already been sent — a slow or unreachable webhook
+    never delays or affects the response the caller gets back."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                url,
+                json=payload,
+                headers={"X-FSM-Sentinel": "true"},
+                timeout=10.0,
+            )
+    except Exception as exc:
+        print(f"[WEBHOOK] Failed to POST to {url}: {exc}")
+
+
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(
+    file: UploadFile = File(...),
+    webhook_url: Optional[str] = None,
+    background_tasks: BackgroundTasks = None,
+):
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = await _save_upload_to_tempdir(file, tmpdir)
@@ -129,12 +171,17 @@ async def analyze(file: UploadFile = File(...)):
             results = [_analyze_one(entry) for entry in fsms]
             total_warnings = sum(r["summary"]["total_warnings"] for r in results)
 
-            return {
+            response = {
                 "filename": file.filename,
                 "modules_found": len(results),
                 "results": results,
                 "total_warnings": total_warnings,
             }
+
+            if webhook_url and background_tasks is not None:
+                background_tasks.add_task(post_webhook, webhook_url, response)
+
+            return response
     except FSMError as exc:
         return _error_response(exc.error, exc.detail)
     except Exception as exc:
@@ -279,10 +326,14 @@ def _visualize_one(entry):
     states = entry["states"]
     reset_state = entry["reset_state"]
     graph = entry["graph"]
+    parser_warnings = entry.get("parser_warnings", [])
 
     unreachable = set(fsm.check_reachability(graph, reset_state, list(states.keys())))
     deadlocks = fsm.check_deadlocks(graph, reset_state)
     deadlock_conditions = {state_name: condition for state_name, condition in deadlocks}
+    confidence = fsm.compute_confidence(
+        entry["module_name"], states, graph, parser_warnings, reset_state=reset_state
+    )
 
     nodes = []
     for state_name in states:
@@ -297,7 +348,9 @@ def _visualize_one(entry):
 
         node = {"id": state_name, "label": state_name, "type": node_type}
         if node_type == "deadlock":
+            condition = deadlock_conditions[state_name]
             node["severity"] = fsm.score_severity(state_name, graph)
+            node["bug_pattern"] = fsm.classify_bug_pattern(state_name, condition, graph)["pattern"]
         nodes.append(node)
 
     edges = [
@@ -315,6 +368,7 @@ def _visualize_one(entry):
             "deadlocked_states": list(deadlock_conditions.keys()),
             "unreachable_states": sorted(unreachable),
             "total_states": len(states),
+            "parse_confidence": confidence,
         },
     }
 
@@ -333,3 +387,397 @@ async def visualize(file: UploadFile = File(...)):
         return _error_response(
             "Internal error while building visualization", str(exc), status_code=500
         )
+
+
+# =====================================================================
+# Batch analysis (Feature 1)
+# =====================================================================
+
+
+def _analyze_file_for_batch(filepath, display_name):
+    """Return (modules, error) for one file extracted from a batch ZIP.
+    `error` is only set for a genuine parse failure (a file that
+    couldn't even be read as text) — a file that reads fine but simply
+    has no FSM in it just yields an empty modules list, not an error."""
+    try:
+        fsms = fsm.parse_fsm(filepath)
+    except Exception:
+        return None, {"filename": display_name, "error": "Parse failed", "skipped": True}
+
+    modules = []
+    for entry in fsms:
+        analyzed = _analyze_one(entry)
+        modules.append(
+            {
+                "module_name": analyzed["module_name"],
+                "parse_confidence": analyzed["parse_confidence"],
+                "states_found": analyzed["states_found"],
+                "reset_state": analyzed["reset_state"],
+                "deadlocks": analyzed["deadlocks"],
+                "unreachable_states": analyzed["reachability"]["unreachable"],
+                "summary": analyzed["summary"],
+            }
+        )
+    return modules, None
+
+
+@app.post("/analyze/batch")
+async def analyze_batch(
+    file: UploadFile = File(...),
+    webhook_url: Optional[str] = None,
+    background_tasks: BackgroundTasks = None,
+):
+    try:
+        contents = await file.read()
+        if not contents:
+            raise FSMError("Empty file uploaded", "The uploaded ZIP contained no data.")
+        if len(contents) > BATCH_ZIP_MAX_BYTES:
+            raise FSMError(
+                "ZIP file exceeds 10MB limit",
+                f"Uploaded file is {len(contents)} bytes; the limit is "
+                f"{BATCH_ZIP_MAX_BYTES} bytes.",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = str(Path(tmpdir) / "upload.zip")
+            with open(zip_path, "wb") as f:
+                f.write(contents)
+
+            extract_dir = str(Path(tmpdir) / "extracted")
+            os.makedirs(extract_dir, exist_ok=True)
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(extract_dir)
+            except zipfile.BadZipFile:
+                raise FSMError("Invalid ZIP file", "The uploaded file is not a valid ZIP archive")
+
+            verilog_files = []
+            for root, _dirs, filenames in os.walk(extract_dir):
+                for fname in filenames:
+                    if fname.lower().endswith((".v", ".sv")):
+                        verilog_files.append((fname, os.path.join(root, fname)))
+            verilog_files.sort(key=lambda pair: pair[0])
+
+            if not verilog_files:
+                raise FSMError(
+                    "No Verilog files found in ZIP", "The ZIP contained no .v or .sv files"
+                )
+
+            results = []
+            files_with_issues = []
+            total_fsms_found = 0
+            total_deadlocks = 0
+            total_unreachable_states = 0
+
+            for display_name, filepath in verilog_files:
+                modules, error = _analyze_file_for_batch(filepath, display_name)
+                if error is not None:
+                    results.append(error)
+                    continue
+
+                file_deadlocks = sum(len(m["deadlocks"]) for m in modules)
+                file_unreachable = sum(len(m["unreachable_states"]) for m in modules)
+                total_fsms_found += len(modules)
+                total_deadlocks += file_deadlocks
+                total_unreachable_states += file_unreachable
+                if file_deadlocks or file_unreachable:
+                    files_with_issues.append(display_name)
+
+                results.append({"filename": display_name, "modules": modules})
+
+            response = {
+                "batch_summary": {
+                    "files_analyzed": len(verilog_files),
+                    "total_fsms_found": total_fsms_found,
+                    "total_deadlocks": total_deadlocks,
+                    "total_unreachable_states": total_unreachable_states,
+                    "files_with_issues": files_with_issues,
+                },
+                "results": results,
+            }
+
+            if webhook_url and background_tasks is not None:
+                background_tasks.add_task(post_webhook, webhook_url, response)
+
+            return response
+    except FSMError as exc:
+        return _error_response(exc.error, exc.detail)
+    except Exception as exc:
+        return _error_response(
+            "Internal error while running batch analysis", str(exc), status_code=500
+        )
+
+
+# =====================================================================
+# Historical comparison (Feature 2)
+# =====================================================================
+
+
+@app.post("/compare")
+async def compare(file_v1: UploadFile = File(...), file_v2: UploadFile = File(...)):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            v1_path = await _save_upload_to_tempdir(file_v1, tmpdir, basename="v1")
+            v2_path = await _save_upload_to_tempdir(file_v2, tmpdir, basename="v2")
+
+            v1_fsms = _parse_or_raise(v1_path)
+            v2_fsms = _parse_or_raise(v2_path)
+
+            v1_by_name = {e["module_name"]: e for e in v1_fsms}
+            v2_by_name = {e["module_name"]: e for e in v2_fsms}
+            all_module_names = sorted(set(v1_by_name) | set(v2_by_name))
+
+            modules_out = []
+            total_fixed = 0
+            total_introduced = 0
+            total_unchanged = 0
+
+            for module_name in all_module_names:
+                v1_entry = v1_by_name.get(module_name)
+                v2_entry = v2_by_name.get(module_name)
+
+                if v1_entry is not None:
+                    v1_states = set(v1_entry["states"].keys())
+                    v1_deadlocks = dict(
+                        fsm.check_deadlocks(v1_entry["graph"], v1_entry["reset_state"])
+                    )
+                    v1_unreachable = fsm.check_reachability(
+                        v1_entry["graph"], v1_entry["reset_state"], list(v1_states)
+                    )
+                    v1_warnings = len(v1_deadlocks) + len(v1_unreachable)
+                else:
+                    v1_states, v1_deadlocks, v1_warnings = set(), {}, 0
+
+                if v2_entry is not None:
+                    v2_states = set(v2_entry["states"].keys())
+                    v2_deadlocks = dict(
+                        fsm.check_deadlocks(v2_entry["graph"], v2_entry["reset_state"])
+                    )
+                    v2_unreachable = fsm.check_reachability(
+                        v2_entry["graph"], v2_entry["reset_state"], list(v2_states)
+                    )
+                    v2_warnings = len(v2_deadlocks) + len(v2_unreachable)
+                else:
+                    v2_states, v2_deadlocks, v2_warnings = set(), {}, 0
+
+                fixed = [
+                    {
+                        "state": s,
+                        "condition": v1_deadlocks[s],
+                        "fix_description": "Deadlock resolved between versions",
+                    }
+                    for s in v1_deadlocks
+                    if s not in v2_deadlocks
+                ]
+                introduced = [
+                    {
+                        "state": s,
+                        "condition": v2_deadlocks[s],
+                        "fix_description": "New deadlock introduced between versions",
+                    }
+                    for s in v2_deadlocks
+                    if s not in v1_deadlocks
+                ]
+                unchanged = [
+                    {"state": s, "condition": v2_deadlocks[s]}
+                    for s in v2_deadlocks
+                    if s in v1_deadlocks
+                ]
+
+                total_fixed += len(fixed)
+                total_introduced += len(introduced)
+                total_unchanged += len(unchanged)
+
+                modules_out.append(
+                    {
+                        "module_name": module_name,
+                        "v1_warnings": v1_warnings,
+                        "v2_warnings": v2_warnings,
+                        "changes": {
+                            "fixed": fixed,
+                            "introduced": introduced,
+                            "unchanged": unchanged,
+                            "added_states": sorted(v2_states - v1_states),
+                            "removed_states": sorted(v1_states - v2_states),
+                        },
+                    }
+                )
+
+            if total_fixed and total_introduced:
+                verdict = "MIXED"
+            elif total_fixed:
+                verdict = "IMPROVED"
+            elif total_introduced:
+                verdict = "REGRESSED"
+            else:
+                verdict = "UNCHANGED"
+
+            return {
+                "comparison_summary": {
+                    "bugs_fixed": total_fixed,
+                    "bugs_introduced": total_introduced,
+                    "bugs_unchanged": total_unchanged,
+                    "verdict": verdict,
+                },
+                "modules": modules_out,
+                "verdict": verdict,
+            }
+    except FSMError as exc:
+        return _error_response(exc.error, exc.detail)
+    except Exception as exc:
+        return _error_response("Internal error while comparing files", str(exc), status_code=500)
+
+
+# =====================================================================
+# PDF export (Feature 4)
+# =====================================================================
+
+
+def _build_pdf_report(filename, module_results):
+    """Build the full analysis report as a PDF and return its raw
+    bytes. Built entirely in memory (io.BytesIO) — no temp file needed
+    for the PDF itself; the source .v file was already handled via
+    tempfile by the caller."""
+    import io
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    mono_style = ParagraphStyle("Mono", parent=styles["Normal"], fontName="Courier", fontSize=9)
+    severity_colors = {"HIGH": colors.red, "MEDIUM": colors.orange, "LOW": colors.Color(0.6, 0.6, 0)}
+
+    total_fsms = len(module_results)
+    total_deadlocks = sum(len(m["deadlocks_raw"]) for m in module_results)
+    total_unreachable = sum(len(m["unreachable"]) for m in module_results)
+
+    story = [
+        Spacer(1, 1.5 * inch),
+        Paragraph("FSM Sentinel Analysis Report", styles["Title"]),
+        Paragraph("Hardware State Machine Security Analysis", styles["Heading2"]),
+        Spacer(1, 0.4 * inch),
+        Paragraph(f"File analyzed: {filename}", styles["Normal"]),
+        Paragraph(
+            f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]
+        ),
+        Spacer(1, 0.3 * inch),
+        Paragraph(
+            f"{total_fsms} FSM(s) analyzed, {total_deadlocks} deadlock(s) found, "
+            f"{total_unreachable} unreachable state(s) found",
+            styles["Normal"],
+        ),
+        PageBreak(),
+    ]
+
+    for m in module_results:
+        story.append(Paragraph(f"Module: {m['module_name']}", styles["Heading1"]))
+        story.append(Paragraph(f"States found: {m['states_found']}", styles["Normal"]))
+        story.append(Paragraph(f"Reset state: {m['reset_state']}", styles["Normal"]))
+        story.append(Paragraph(f"Parse confidence: {m['parse_confidence']}%", styles["Normal"]))
+        story.append(Spacer(1, 0.2 * inch))
+
+        story.append(Paragraph("Reachability", styles["Heading2"]))
+        if not m["unreachable"]:
+            story.append(Paragraph("PASS — all states reachable from reset.", styles["Normal"]))
+        else:
+            for state_name in m["unreachable"]:
+                story.append(Paragraph(f"Unreachable: {state_name}", mono_style))
+        story.append(Spacer(1, 0.2 * inch))
+
+        story.append(Paragraph("Deadlocks", styles["Heading2"]))
+        severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        if not m["deadlocks_raw"]:
+            story.append(Paragraph("PASS — no deadlocks detected.", styles["Normal"]))
+        else:
+            for d in m["deadlocks_raw"]:
+                severity_counts[d["severity"]] = severity_counts.get(d["severity"], 0) + 1
+                sev_style = ParagraphStyle(
+                    f"Sev_{d['state']}",
+                    parent=styles["Normal"],
+                    textColor=severity_colors.get(d["severity"], colors.black),
+                    fontName="Helvetica-Bold",
+                )
+                story.append(Paragraph(f"State: {d['state']}  [{d['severity']}]", sev_style))
+                story.append(Paragraph(f"Bug pattern: {d['bug_pattern']}", styles["Normal"]))
+                story.append(Paragraph(d["pattern_description"], styles["Normal"]))
+                story.append(Paragraph(f"Blocking condition: {d['condition']}", mono_style))
+                story.append(Paragraph(f"Failure scenario: {d['scenario']}", styles["Normal"]))
+                if d.get("suggested_fix"):
+                    story.append(Paragraph("Suggested fix:", styles["Normal"]))
+                    fix_text = d["suggested_fix"].replace("\n", "<br/>").replace(" ", "&nbsp;")
+                    story.append(Paragraph(fix_text, mono_style))
+                story.append(Spacer(1, 0.15 * inch))
+
+        table_data = [
+            ["Total warnings", str(m["summary"]["total_warnings"])],
+            ["HIGH severity", str(severity_counts.get("HIGH", 0))],
+            ["MEDIUM severity", str(severity_counts.get("MEDIUM", 0))],
+            ["LOW severity", str(severity_counts.get("LOW", 0))],
+        ]
+        table = Table(table_data, colWidths=[2.5 * inch, 1.5 * inch])
+        table.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ]
+            )
+        )
+        story.append(table)
+        story.append(PageBreak())
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+@app.post("/export/pdf")
+async def export_pdf(file: UploadFile = File(...)):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = await _save_upload_to_tempdir(file, tmpdir)
+            fsms = _parse_or_raise(tmp_path)
+
+            with open(tmp_path, "r") as f:
+                fsm_source = f.read()
+
+            module_results = []
+            for entry in fsms:
+                analyzed = _analyze_one(entry)
+                deadlocks_raw = []
+                for d in analyzed["deadlocks"]:
+                    # The "same template fix the engine generates" per the
+                    # PDF spec: the deterministic template specifically
+                    # (not generate_fix, which may call a live LLM — not
+                    # appropriate to trigger just for a report preview).
+                    try:
+                        suggested_fix = fsm._template_fix(
+                            d["state"], d["condition"], fsm_source, module_name=entry["module_name"]
+                        )
+                    except Exception:
+                        suggested_fix = None
+                    deadlocks_raw.append({**d, "suggested_fix": suggested_fix})
+
+                module_results.append(
+                    {
+                        **analyzed,
+                        "unreachable": analyzed["reachability"]["unreachable"],
+                        "deadlocks_raw": deadlocks_raw,
+                    }
+                )
+
+            pdf_bytes = _build_pdf_report(file.filename or "uploaded file", module_results)
+
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": 'attachment; filename="fsm_sentinel_report.pdf"'},
+            )
+    except FSMError as exc:
+        return _error_response(exc.error, exc.detail)
+    except Exception as exc:
+        return _error_response("Internal error while generating PDF", str(exc), status_code=500)

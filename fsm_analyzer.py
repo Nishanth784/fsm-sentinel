@@ -227,8 +227,13 @@ def find_matching_paren(text, open_idx):
 
 
 def parse_transitions_for_state(state_name, block_text):
-    """Return a list of (to_state, condition) tuples for one state block."""
+    """Return (transitions, warnings) for one state block: transitions
+    is a list of (to_state, condition) tuples, warnings is a list of the
+    same "[PARSER WARNING] ..." strings this function also prints —
+    printed for CLI parity, and returned so callers (confidence scoring,
+    API responses) can see them without scraping stdout."""
     transitions = []
+    warnings = []
 
     # Scan the comment-masked version throughout: a comment containing an
     # English word like "if" or "else" must never be mistaken for real
@@ -248,11 +253,13 @@ def parse_transitions_for_state(state_name, block_text):
         elif len(assigns) == 0:
             pass
         else:
-            print(
+            warning = (
                 f"[PARSER WARNING] Could not parse transition in state "
                 f"{state_name} — skipped"
             )
-        return transitions
+            print(warning)
+            warnings.append(warning)
+        return transitions, warnings
 
     # For each keyword, determine its condition (balanced-paren scan for
     # if/else if, or the literal "else" for a bare else) and the segment
@@ -292,11 +299,13 @@ def parse_transitions_for_state(state_name, block_text):
         segments.append((condition, masked_block[segment_start:segment_end]))
 
     if not parse_ok:
-        print(
+        warning = (
             f"[PARSER WARNING] Could not parse transition in state "
             f"{state_name} — skipped"
         )
-        return transitions
+        print(warning)
+        warnings.append(warning)
+        return transitions, warnings
 
     for condition, segment in segments:
         assigns = ASSIGNMENT.findall(segment)
@@ -307,23 +316,28 @@ def parse_transitions_for_state(state_name, block_text):
             # not an error by itself.
             continue
         else:
-            print(
+            warning = (
                 f"[PARSER WARNING] Could not parse transition in state "
                 f"{state_name} — skipped"
             )
+            print(warning)
+            warnings.append(warning)
 
-    return transitions
+    return transitions, warnings
 
 
 def build_graph(case_block, state_names):
+    """Return (graph, parser_warnings)."""
     blocks = split_state_blocks(case_block, state_names)
     graph = {name: [] for name in state_names}
+    parser_warnings = []
 
     for state_name, block_text in blocks.items():
-        transitions = parse_transitions_for_state(state_name, block_text)
+        transitions, state_warnings = parse_transitions_for_state(state_name, block_text)
         graph[state_name].extend(transitions)
+        parser_warnings.extend(state_warnings)
 
-    return graph
+    return graph, parser_warnings
 
 
 def check_reachability(graph, reset_state, all_states):
@@ -405,9 +419,157 @@ def score_severity(state_name, graph):
     return "LOW"
 
 
-def print_report(filename, states, reset_state, unreachable, deadlocks, graph):
+PROTOCOL_KEYWORDS = ("axi", "uart", "spi", "i2c", "apb", "ahb")
+
+
+def classify_bug_pattern(state_name, condition, graph):
+    """Classify a deadlock's blocking condition into one of five named
+    bug patterns, checked in this priority order (first match wins):
+
+    1. handshake_deadlock — condition contains both 'valid' and 'ready'
+    2. single_signal_deadlock — condition is a single bare reference to
+       exactly one external (handshake) signal: no boolean operators
+       (&&/||) and no comparison, so there's nothing else going on
+    3. counter_overflow_deadlock — condition contains a counter
+       comparison (==/!= N) and does NOT also reference an external
+       handshake signal (if it did, this is really a handshake/
+       protocol bug that happens to also check a counter, which the
+       earlier/later patterns describe better)
+    4. missing_default_deadlock — the state has 2+ distinct branches
+       (an if/else-if chain) and none of them is unconditional; a
+       single lone condition doesn't count as "missing a default" in
+       the way a multi-way branch with no fallback does
+    5. protocol_violation_deadlock — state name or condition mentions
+       a known bus/protocol keyword
+
+    Falls back to "unclassified_deadlock" if nothing matches. This is
+    purely a reporting-layer annotation, like score_severity — it does
+    not change which states check_deadlocks() flags.
+    """
+    condition_lower = condition.lower()
+    name_lower = state_name.lower()
+    transitions = graph.get(state_name, [])
+
+    has_boolean_op = "&&" in condition or "||" in condition
+    has_comparison = bool(re.search(r"==|!=", condition))
+    external_signal_tokens = {
+        tok
+        for tok in re.findall(r"[a-zA-Z_]\w*", condition)
+        if is_handshake_condition(tok)
+    }
+
+    if "valid" in condition_lower and "ready" in condition_lower:
+        return {
+            "pattern": "handshake_deadlock",
+            "description": (
+                "FSM waits for a handshake that never completes. "
+                "Common in AXI protocol implementations where "
+                "valid/ready pairs must both assert to proceed."
+            ),
+        }
+
+    if not has_boolean_op and not has_comparison and len(external_signal_tokens) == 1:
+        return {
+            "pattern": "single_signal_deadlock",
+            "description": (
+                "FSM stalls on a single external signal with no "
+                "fallback. Any failure of that signal permanently "
+                "freezes the state machine."
+            ),
+        }
+
+    has_counter_comparison = bool(re.search(r"==\s*\d+|!=\s*\d+", condition))
+    if has_counter_comparison and not external_signal_tokens:
+        return {
+            "pattern": "counter_overflow_deadlock",
+            "description": (
+                "FSM depends on a counter reaching a specific value. "
+                "If the counter never reaches that value due to "
+                "upstream logic, the FSM stalls indefinitely."
+            ),
+        }
+
+    if len(transitions) >= 2 and not any(cond == "unconditional" for _to, cond in transitions):
+        return {
+            "pattern": "missing_default_deadlock",
+            "description": (
+                "FSM has no default transition. Unexpected input "
+                "combinations leave the state machine with no valid "
+                "next state."
+            ),
+        }
+
+    if any(kw in name_lower or kw in condition_lower for kw in PROTOCOL_KEYWORDS):
+        return {
+            "pattern": "protocol_violation_deadlock",
+            "description": (
+                "FSM implements a hardware protocol and deadlocks on "
+                "a protocol handshake. This class of bug is "
+                "particularly dangerous as it can cause system-wide "
+                "bus lockup, not just local FSM failure."
+            ),
+        }
+
+    return {
+        "pattern": "unclassified_deadlock",
+        "description": (
+            "Deadlock condition does not match known patterns. Manual "
+            "review recommended."
+        ),
+    }
+
+
+def compute_confidence(module_name, states, graph, parser_warnings, reset_state=None):
+    """Score 0-100: how completely the parser extracted this FSM.
+
+    Deductions from a starting score of 100:
+    - 5 points per parser warning (a skipped/unparseable transition)
+    - 3 points per state with zero outgoing transitions
+    - 20 points if the reset state couldn't be determined
+    - 15 points if fewer than 3 states were found (likely incomplete parse)
+    - 10 points if more than 30% of states have empty transition lists
+    Floored at 0.
+
+    `reset_state` isn't part of the signature the spec for this
+    function gave (compute_confidence(module_name, states, graph,
+    parser_warnings)) — it's added as a keyword arg at the end, kept
+    optional so any caller using that exact positional signature still
+    works. It's needed because "reset state could not be determined"
+    is one of the stated deductions and there's no way to detect that
+    from states/graph alone.
+
+    `module_name` isn't used in the scoring itself (no rule references
+    it) — kept in the signature to match the spec exactly.
+    """
+    _ = module_name  # unused, kept for signature compatibility
+    score = 100
+
+    score -= 5 * len(parser_warnings)
+
+    zero_exit_states = [name for name, transitions in graph.items() if not transitions]
+    score -= 3 * len(zero_exit_states)
+
+    if reset_state is None:
+        score -= 20
+
+    if len(states) < 3:
+        score -= 15
+
+    if states and (len(zero_exit_states) / len(states)) > 0.3:
+        score -= 10
+
+    return max(0, score)
+
+
+def print_report(
+    filename, states, reset_state, unreachable, deadlocks, graph, module_name=None, confidence=None
+):
     print("=== FSM Analysis Report ===")
     print(f"File: {filename}")
+    if module_name is not None:
+        print(f"Module: {module_name}")
+    if confidence is not None:
+        print(f"Parse confidence: {confidence}%")
     print(f"States found: {len(states)}")
     print(f"Reset state: {reset_state}")
     print()
@@ -427,7 +589,10 @@ def print_report(filename, states, reset_state, unreachable, deadlocks, graph):
     else:
         for state_name, condition in deadlocks:
             severity = score_severity(state_name, graph)
+            pattern_info = classify_bug_pattern(state_name, condition, graph)
             print(f"[WARN] Potential deadlock: state '{state_name}'  [SEVERITY: {severity}]")
+            print(f"       Bug pattern: {pattern_info['pattern']}")
+            print(f"       Pattern description: {pattern_info['description']}")
             print(f"       Blocking condition: {condition}")
             print(
                 f"       Failure scenario: If {condition} never asserts while"
@@ -456,8 +621,12 @@ def parse_fsm(filepath):
 
     Returns a list of dicts, one per FSM module found:
         [{"module_name": ..., "states": {...}, "reset_state": ...,
-          "graph": {...}}, ...]
+          "graph": {...}, "parser_warnings": [...]}, ...]
     (possibly empty, if the file has no FSM modules at all).
+    parser_warnings is the list of "[PARSER WARNING] ..." strings (if
+    any) produced while parsing that module's transitions — the same
+    ones printed to stdout, also returned so callers (confidence
+    scoring, API responses) don't have to scrape stdout for them.
     """
     with open(filepath, "r") as f:
         text = f.read()
@@ -477,7 +646,7 @@ def parse_fsm(filepath):
             continue
 
         reset_state = extract_reset_state(module_body, states)
-        graph = build_graph(case_block, list(states.keys()))
+        graph, parser_warnings = build_graph(case_block, list(states.keys()))
 
         results.append(
             {
@@ -485,6 +654,7 @@ def parse_fsm(filepath):
                 "states": states,
                 "reset_state": reset_state,
                 "graph": graph,
+                "parser_warnings": parser_warnings,
             }
         )
 
@@ -500,12 +670,29 @@ def get_fsm(fsm_list, module_name):
     return None
 
 
-def analyze_and_report(filepath, states, reset_state, graph):
+def analyze_and_report(filepath, states, reset_state, graph, module_name=None, parser_warnings=None):
     """Run reachability + deadlock checks, print the report, and return
-    the list of (state_name, condition) deadlocks found."""
+    the list of (state_name, condition) deadlocks found.
+
+    `module_name` and `parser_warnings` are optional (and kept at the
+    end, defaulting to None/[]) so fix_and_verify's existing internal
+    call — analyze_and_report(output_filepath, states, reset_state,
+    graph), unchanged, since fix_and_verify itself is not to be
+    touched — keeps working exactly as before; it just won't show a
+    Module:/confidence line during the [VERIFY] re-report. main()
+    passes both explicitly to get the full report.
+    """
     unreachable = check_reachability(graph, reset_state, list(states.keys()))
     deadlocks = check_deadlocks(graph, reset_state)
-    print_report(filepath, states, reset_state, unreachable, deadlocks, graph)
+    confidence = None
+    if module_name is not None:
+        confidence = compute_confidence(
+            module_name, states, graph, parser_warnings or [], reset_state=reset_state
+        )
+    print_report(
+        filepath, states, reset_state, unreachable, deadlocks, graph,
+        module_name=module_name, confidence=confidence,
+    )
     return deadlocks
 
 
@@ -990,7 +1177,11 @@ def main():
 
     module_name = target["module_name"]
     states, reset_state, graph = target["states"], target["reset_state"], target["graph"]
-    deadlocks = analyze_and_report(filepath, states, reset_state, graph)
+    parser_warnings = target.get("parser_warnings", [])
+    deadlocks = analyze_and_report(
+        filepath, states, reset_state, graph,
+        module_name=module_name, parser_warnings=parser_warnings,
+    )
 
     if auto_fix and deadlocks:
         fix_and_verify(filepath, deadlocks, graph, states, reset_state, module_name=module_name)

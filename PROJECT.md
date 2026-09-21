@@ -1,18 +1,24 @@
 ## SYSTEM STATE
-fsm_analyzer.py: VALIDATED (analysis + fix engine + multi-FSM parsing + severity scoring)
-api.py: VALIDATED (FastAPI wrapper — /analyze, /fix, /download, /visualize all tested live via curl and requests, all multi-FSM aware)
-test_fsm_analyzer.py: VALIDATED (14/14 tests passing)
+fsm_analyzer.py: VALIDATED (analysis + fix engine + multi-FSM parsing + severity scoring + confidence scoring + bug-pattern classification)
+api.py: VALIDATED (FastAPI wrapper — /analyze, /fix, /download, /visualize, /analyze/batch, /compare, /export/pdf, all tested live via curl and requests, all multi-FSM aware)
+test_fsm_analyzer.py: VALIDATED (21/21 tests passing)
 axi_master.v: REAL PRODUCTION FILE. Contains 4 modules: tb_connect_m_s
   (testbench), connect_m_s (instantiation-only wrapper), axi_master (14
   states, 1 deadlock), axi4_slave (17 states, 0 deadlocks, 1 unreachable
   state). parse_fsm() correctly skips the first two (no FSM structure)
   and analyzes the latter two.
-axi_master_fixed.v: GENERATED OUTPUT — produced by `python fsm_analyzer.py axi_master.v --fix`; not hand-maintained, regenerate via the tool
+axi_master_fixed.v: GENERATED OUTPUT — produced by `python fsm_analyzer.py axi_master.v --fix`; not hand-maintained, regenerate via the tool. Also used as v2 input for TEST 16 (/compare).
 test_cases/unreachable_fsm.v: BUILT — synthetic fixture with a
   deliberately unreachable state ('orphan'), used by TEST 14
 Fix engine: BUILT — generate_fix / show_diff / apply_fix / fix_and_verify added; provider order Groq -> Anthropic -> template fallback; verified end-to-end via the template fallback (wdata_last deadlock -> 0 warnings); neither live provider reachable/validated from this sandbox (see FIX ENGINE section)
+Batch analysis (/analyze/batch): BUILT/VALIDATED
+Historical comparison (/compare): BUILT/VALIDATED
+Confidence scoring (compute_confidence): BUILT/VALIDATED
+PDF export (/export/pdf): BUILT/VALIDATED
+Bug pattern classification (classify_bug_pattern): BUILT/VALIDATED
+Webhook support (webhook_url on /analyze and /analyze/batch): BUILT/VALIDATED
 Last updated by: Claude Code
-Last updated at: 2026-09-21T11:47:37Z
+Last updated at: 2026-09-21T12:08:44Z
 
 ## ARCHITECTURE DECISIONS
 - Parser uses Python re only — no third party Verilog libraries
@@ -45,6 +51,35 @@ Last updated at: 2026-09-21T11:47:37Z
   `tempfile.TemporaryDirectory()` per request — nothing from an upload
   is ever written outside that directory, and it's deleted when the
   request finishes, so no upload persists on disk
+- New libraries: `reportlab` (PDF generation for /export/pdf) and
+  `httpx` (async HTTP client for webhook POSTs). `zipfile` (batch
+  ZIP handling) is stdlib, no install needed.
+- compute_confidence() and classify_bug_pattern() are pure reporting-
+  layer functions computed from check_deadlocks()'s already-decided
+  output — like score_severity(), they never change which states get
+  flagged, and check_deadlocks() itself remains untouched throughout
+  this round of changes.
+- analyze_and_report() and print_report() both gained new *optional*
+  keyword-only-in-practice parameters (module_name, confidence for
+  print_report; module_name, parser_warnings for analyze_and_report)
+  specifically so fix_and_verify's existing internal call —
+  analyze_and_report(output_filepath, states, reset_state, graph),
+  unchanged — keeps working exactly as-is without fix_and_verify's
+  body being touched at all, per the hard constraint not to touch it.
+  The tradeoff: fix_and_verify's own [VERIFY] re-report doesn't show a
+  Module:/confidence line, since it doesn't pass those new args.
+  main() does pass them, so `python fsm_analyzer.py axi_master.v`
+  shows the full report with confidence/bug-pattern.
+- compute_confidence's signature deviates slightly from the one given
+  in the spec (`compute_confidence(module_name, states, graph,
+  parser_warnings)`): it adds `reset_state=None` as a trailing keyword
+  argument, since one of the spec's own stated deductions ("if reset
+  state could not be determined: -20 points") is impossible to compute
+  without knowing the reset state, and there's no way to infer that
+  from states/graph/parser_warnings alone. Kept optional and at the
+  end so any caller using the exact spec'd positional signature still
+  works; module_name itself isn't used in the scoring (no rule
+  references it), kept only for signature fidelity.
 
 ## PARSER CHANGES (validating against the real axi_master.v)
 - Case labels can group multiple states on one line (e.g.
@@ -268,6 +303,127 @@ just axi_master.
   tool, not planted; test_cases/unreachable_fsm.v exists as a clean,
   deliberate, single-purpose example for TEST 14 specifically.
 
+## ADVANCED BACKEND FEATURES (batch, compare, confidence, PDF, bug patterns, webhooks)
+
+### Batch analysis — POST /analyze/batch
+- Accepts a .zip (10MB limit, checked before extraction), extracts to
+  a tempdir, walks it recursively for *.v/*.sv files, runs parse_fsm()
+  on each. A file that can't even be read/parsed is reported as
+  `{"filename", "error": "Parse failed", "skipped": true}`; a file
+  that parses fine but has no FSM in it just contributes an empty
+  `modules: []` (not an error — plenty of real .v files aren't FSMs).
+- Errors: no .v/.sv files found, malformed ZIP, and the size limit
+  each return a distinct `{"error": ...}` before any extraction/parsing
+  is attempted for the size and malformed-ZIP cases.
+- Real result analyzing axi_master.v via batch: 1 file, 2 FSMs found
+  (axi_master + axi4_slave, same as the non-batch /analyze), 1
+  deadlock total — matches TEST 15 exactly.
+
+### Historical comparison — POST /compare
+- Takes file_v1 + file_v2, parses both with parse_fsm(), and diffs
+  per module (matched by module_name, since a module can exist in one
+  version and not the other): deadlocks present in v1 but not v2 are
+  "fixed", present in v2 but not v1 are "introduced", present in both
+  are "unchanged"; states are diffed the same way into added/removed.
+  Matching a deadlock across versions is done by state name, not exact
+  condition string, since the condition can legitimately change
+  slightly between versions for what's conceptually the same bug.
+- Verdict: MIXED if both fixed>0 and introduced>0 (net changes in
+  both directions beats a pure count comparison), else IMPROVED if
+  only fixed>0, REGRESSED if only introduced>0, else UNCHANGED.
+- `_save_upload_to_tempdir` gained an optional `basename` param
+  specifically for this endpoint — v1 and v2 share one tempdir, and
+  without distinct basenames ("v1"/"v2" instead of the default
+  "upload") the second upload would silently overwrite the first.
+- Verified with the real axi_master.v (v1) vs axi_master_fixed.v (v2):
+  wdata_last shows as fixed in the axi_master module, verdict
+  IMPROVED, and axi4_slave (unchanged by the fix, same file content in
+  both versions) correctly shows no changes at all — matches TEST 16.
+
+### Confidence scoring — compute_confidence()
+- See ARCHITECTURE DECISIONS for the signature deviation
+  (reset_state added as a trailing optional kwarg).
+- axi_master scores 100/100 (no parser warnings, no zero-exit states,
+  reset state determined, 14 states). axi4_slave scores 94/100 — the
+  only deduction is 2 zero-exit states, i.e. states with no outgoing
+  transitions at all (this includes `comp_rd_tx`, its genuinely unused
+  state, and is a real, meaningful signal about that module, not a
+  parser gap). Wired into the CLI report ("Parse confidence: NN%"),
+  every module result in /analyze, /fix (via the shared _analyze_one
+  building block used across endpoints), /analyze/batch, and
+  /visualize's metadata.
+
+### PDF export — POST /export/pdf
+- Built with reportlab's SimpleDocTemplate, entirely in memory
+  (io.BytesIO) — no temp file needed for the PDF itself, only the
+  uploaded .v file goes through tempfile as usual. Cover page (title,
+  subtitle, filename, timestamp, FSM/deadlock/unreachable counts) +
+  one section per module (states, reset state, confidence,
+  reachability, one block per deadlock with a color-coded severity
+  label — red/orange/yellow-ish for HIGH/MEDIUM/LOW — bug pattern name
+  + description, blocking condition and scenario in a monospace style,
+  and a suggested fix) + a summary table (total warnings, severity
+  breakdown).
+- The "suggested fix" is generated by calling fsm._template_fix()
+  directly (not the public generate_fix(), which may call a live LLM)
+  — the PDF spec explicitly asks for "the same template fix the engine
+  generates", and triggering a live API call just to render a report
+  preview would be slow, nondeterministic, and could fail the whole
+  export over a network issue for something that's meant to be a
+  quick illustrative suggestion.
+- Verified: response Content-Type is application/pdf, Content-
+  Disposition names it fsm_sentinel_report.pdf, and the bytes start
+  with the literal `%PDF-` header (checked directly, not just trusted
+  from the Content-Type) — matches TEST 18. Real output against
+  axi_master.v is 3 pages (cover + axi_master + axi4_slave).
+
+### Bug pattern classification — classify_bug_pattern()
+- Five named patterns, checked in a specific priority order (first
+  match wins) chosen to make the patterns mutually exclusive rather
+  than overlapping in the obvious-but-wrong way a literal reading of
+  each rule in isolation would produce. Concretely:
+  - counter_overflow_deadlock additionally requires the condition
+    NOT also reference an external handshake signal — otherwise
+    wdata_last's condition ("m_axi_wready && burst_count == 0", which
+    does contain a "== 0" counter comparison) would match this pattern
+    before ever reaching protocol_violation_deadlock, which is not
+    what the task's own worked example wants.
+  - missing_default_deadlock additionally requires 2+ distinct
+    branches (an if/else-if chain) with none unconditional — every
+    single-branch deadlock (i.e. most of them, definitionally, since
+    check_deadlocks only flags states with no unconditional/timeout
+    exit at all) would otherwise trivially match this pattern first
+    and the other four named patterns would be unreachable in
+    practice.
+  These two refinements were necessary to make wdata_last actually
+  land on protocol_violation_deadlock or handshake_deadlock as the
+  task's own example says it should — implemented literally without
+  them, the given rule text does not produce that result for the real
+  wdata_last condition.
+- wdata_last classifies as protocol_violation_deadlock (its condition
+  contains "axi", as a substring of "m_axi_") — matches TEST 19, which
+  accepts either of the two patterns the task names as correct.
+- Wired into: the CLI report ("Bug pattern: ..." / "Pattern
+  description: ..."), every deadlock in /analyze, /fix, and
+  /analyze/batch's JSON (`bug_pattern` + `pattern_description`),
+  /visualize's deadlock nodes (`bug_pattern` only, per the spec'd node
+  shape), and /export/pdf's per-deadlock sections.
+
+### Webhook support — webhook_url on /analyze and /analyze/batch
+- Optional `webhook_url` query param + FastAPI `BackgroundTasks`: the
+  main response is returned to the caller first, then (if a URL was
+  given) the same JSON is POSTed to it in the background via httpx,
+  with header `X-FSM-Sentinel: true`. A failed webhook POST is logged
+  (`[WEBHOOK] Failed to POST to {url}: {exc}`) and never affects the
+  caller's response, which has already been sent by the time the
+  background task even runs.
+- Verified with a real HTTP round-trip: TEST 21 spins up a throwaway
+  `http.server.HTTPServer` in a background thread as the mock webhook
+  receiver, calls /analyze with webhook_url pointing at it, and checks
+  the receiver actually got a POST carrying the X-FSM-Sentinel header
+  and a payload matching the main response — not a mocked/stubbed
+  check, an actual second HTTP request observed landing.
+
 ## TASK QUEUE
 [x] Build fsm_analyzer.py — Claude Code
 [x] Validate against axi_master.v — Claude Code
@@ -287,6 +443,14 @@ just axi_master.
 [x] Add score_severity() + wire severity into CLI/API/visualize — Claude Code
 [x] Build test_cases/unreachable_fsm.v + TEST 14 — Claude Code
 [x] Add TEST 11/12/13/14, all 14 tests passing — Claude Code
+[x] Build POST /analyze/batch (ZIP upload, multi-file consolidated report) — Claude Code
+[x] Build POST /compare (v1 vs v2 diff: fixed/introduced/unchanged bugs, added/removed states, verdict) — Claude Code
+[x] Add compute_confidence() + wire parse_confidence into CLI/API/visualize — Claude Code
+[x] Build POST /export/pdf (reportlab, cover + per-module sections + severity table) — Claude Code
+[x] Add classify_bug_pattern() + wire bug_pattern into CLI/API/visualize/PDF — Claude Code
+[x] Add webhook_url support (BackgroundTasks + httpx) to /analyze and /analyze/batch — Claude Code
+[x] Add TEST 15-21, all 21 tests passing — Claude Code
+[x] Re-verify CLI commands (axi_master.v, axi_master.v --fix, unreachable_fsm.v) unchanged in substance after all of the above — Claude Code
 [ ] Build web UI — Devin
 [ ] Build state diagram visualizer — consume POST /visualize's
     `modules[].{nodes,edges,metadata}` (D3 force-directed graph; node
@@ -303,15 +467,32 @@ just axi_master.
     auto-fix unreachability, only deadlocks) — whoever owns the demo
     script, since it'll show up as a real, correctly-reported warning
     if axi4_slave is included in the demo
+[ ] Batch upload UI — wire to POST /analyze/batch (multi-file drag/drop,
+    consolidated results table) — Devin
+[ ] Version-diff UI — wire to POST /compare (two-file upload, verdict
+    badge, fixed/introduced/unchanged lists, added/removed states) — Devin
+[ ] "Download PDF report" button — wire to POST /export/pdf — Devin
+[ ] Show parse_confidence % somewhere in the module header/card in the UI — Devin
+[ ] Show bug_pattern + pattern_description on deadlock cards/nodes — Devin
+[ ] CI/CD integration docs — document webhook_url usage for pipeline
+    integration (POST /analyze?webhook_url=... or /analyze/batch) —
+    whoever writes user-facing docs
 
 ## DO NOT TOUCH
 fsm_analyzer.py core parser logic — owned by Claude Code, validated against axi_master.v
 Any function that builds the graph dict
-The deadlock detection logic in Check B (check_deadlocks, is_safe_exit,
-  is_handshake_condition — score_severity is a separate, additive
-  reporting-layer function and does not touch these)
+check_deadlocks(), is_safe_exit(), is_handshake_condition() — the core
+  deadlock detection logic. score_severity(), classify_bug_pattern(),
+  and compute_confidence() are all separate, additive reporting-layer
+  functions computed from check_deadlocks()'s already-decided output;
+  none of them touch it or change which states get flagged.
+apply_fix() and fix_and_verify() — owned by Claude Code, untouched
+  through this round of changes (analyze_and_report/print_report grew
+  new *optional* trailing params instead, specifically so
+  fix_and_verify's existing internal call didn't need to change)
 The fix engine's surgical-replacement and re-verification logic (locate_state_block_span, apply_fix's state-set safety check, fix_and_verify's re-parse) — owned by Claude Code
 api.py's error handling (FSMError + the try/except in each endpoint) and its temp-file handling (tempfile.TemporaryDirectory per request) — owned by Claude Code
+score_severity(), classify_bug_pattern(), compute_confidence() — validated reporting-layer functions, owned by Claude Code
 _mask_comments() and everywhere it's wired in (extract_case_block,
   locate_state_block_span, split_state_blocks, parse_transitions_for_state,
   _template_fix) — owned by Claude Code; this closes a real class of bugs
