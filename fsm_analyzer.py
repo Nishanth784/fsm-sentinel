@@ -13,6 +13,46 @@ TARGET_MODULE = "axi_master"
 HANDSHAKE_KEYWORDS = ("m_axi_", "valid", "ready")
 
 
+def _mask_comments(text):
+    """Return a same-length copy of `text` with the interior of //...
+    line comments and /* ... */ block comments replaced by spaces
+    (newlines kept, so line-based logic still works).
+
+    Every structural token scan in this file (case/endcase, if/else/
+    begin/end matching) runs on this masked version instead of the raw
+    text — English prose in a comment can and does contain words like
+    "case", "if", or "begin" (a real example found in this codebase's
+    own test file: a comment reading "...handle single-beat case
+    (burst_count == 0)..." silently broke case/endcase balance
+    matching before this fix). Masking and original text are always
+    the same length, so any (start, end) offset found by scanning the
+    masked text is valid for slicing the original — which is what
+    every caller actually extracts or writes back, so real code,
+    comments, and formatting are never altered.
+    """
+    result = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        two = text[i : i + 2]
+        if two == "//":
+            j = i
+            while j < n and text[j] != "\n":
+                result[j] = " "
+                j += 1
+            i = j
+        elif two == "/*":
+            end = text.find("*/", i + 2)
+            end = end + 2 if end != -1 else n
+            for j in range(i, end):
+                if text[j] != "\n":
+                    result[j] = " "
+            i = end
+        else:
+            i += 1
+    return "".join(result)
+
+
 def extract_module_body(text, module_name):
     pattern = re.compile(
         r"\bmodule\s+" + re.escape(module_name) + r"\b(.*?)\bendmodule\b",
@@ -43,22 +83,90 @@ def extract_states(module_body):
     return states
 
 
-def extract_reset_state(module_body):
+def extract_reset_state(module_body, states=None):
+    """Find the state a module resets to. Tries, in order:
+
+    1. An active-low bang reset: if (!<signal>) ... state <= <name>;
+       (signal name generalized — not hardcoded to one module's reset
+       pin — so this works across modules with different reset names.)
+    2. An active-low comparison reset: if (<signal> == 0) ... state <= <name>;
+    3. The state register's own declared initial value, e.g.
+       "reg [3:0] state = idle;" or "reg [4:0] state = 0;" — some FSMs
+       set their reset value this way instead of inside the reset
+       branch. A bare numeric value is mapped back to a state name via
+       `states` (the localparam dict) when one is supplied.
+    """
+    # Scope the bang/comparison search to the region before case(state):
+    # the reset check always precedes it in module order, and searching
+    # the whole module_body risks false-matching an ordinary transition
+    # condition deep in the FSM body that happens to look like
+    # "if (X == 0) state <= Y;" (this is not hypothetical — it happened
+    # against axi4_slave, a real module in this codebase's test file).
+    case_match = re.search(r"case\s*\(\s*state\s*\)", module_body)
+    search_region = module_body[: case_match.start()] if case_match else module_body
+
     m = re.search(
-        r"if\s*\(\s*!\s*m_axi_aresetn\s*\)\s*(?:begin)?\s*"
-        r"state\s*<=\s*(\w+)\s*;",
-        module_body,
+        r"if\s*\(\s*!\s*\w+\s*\)\s*(?:begin)?\s*state\s*<=\s*(\w+)\s*;",
+        search_region,
     )
     if m:
         return m.group(1)
+
+    m = re.search(
+        r"if\s*\(\s*\w+\s*==\s*0\s*\)\s*(?:begin)?\s*state\s*<=\s*(\w+)\s*;",
+        search_region,
+    )
+    if m:
+        return m.group(1)
+
+    m = re.search(r"\bstate\s*(?:\[[^\]]*\])?\s*=\s*(\w+)\s*;", search_region)
+    if m:
+        value = m.group(1)
+        if states:
+            if value in states:
+                return value
+            if value.isdigit():
+                for name, num in states.items():
+                    if num == int(value):
+                        return name
+        elif not value.isdigit():
+            return value
+
+    return None
+
+
+CASE_ENDCASE_TOKEN = re.compile(r"\bcase\b|\bendcase\b")
+
+
+def find_matching_endcase(text, case_keyword_start):
+    """Given text[case_keyword_start:] starting at a 'case' keyword,
+    return the (start, end) span of its matching 'endcase' keyword,
+    balancing any case/endcase pairs nested inside (e.g. a
+    `case(some_other_signal) ... endcase` inside one state's block)."""
+    depth = 0
+    for m in CASE_ENDCASE_TOKEN.finditer(text, case_keyword_start):
+        if m.group(0) == "case":
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return m.start(), m.end()
     return None
 
 
 def extract_case_block(module_body):
-    m = re.search(r"case\s*\(\s*state\s*\)(.*?)endcase", module_body, re.DOTALL)
+    masked = _mask_comments(module_body)
+    m = re.search(r"case\s*\(\s*state\s*\)", masked)
     if not m:
         return None
-    return m.group(1)
+    content_start = m.end()
+
+    end_span = find_matching_endcase(masked, m.start())
+    if end_span is None:
+        return None
+    endcase_start, _endcase_end = end_span
+
+    return module_body[content_start:endcase_start]
 
 
 def split_state_blocks(case_block, state_names):
@@ -70,13 +178,15 @@ def split_state_blocks(case_block, state_names):
     Each name in such a group is treated as its own label sharing the
     same block text.
     """
+    masked_case_block = _mask_comments(case_block)
+
     names_alt = "|".join(re.escape(s) for s in state_names)
     label_pattern = re.compile(
         r"((?:(?:" + names_alt + r")\s*,\s*)*(?:" + names_alt + r"))\s*:"
     )
-    labels = list(label_pattern.finditer(case_block))
+    labels = list(label_pattern.finditer(masked_case_block))
 
-    default_match = re.search(r"\bdefault\s*:", case_block)
+    default_match = re.search(r"\bdefault\s*:", masked_case_block)
     case_end = default_match.start() if default_match else len(case_block)
 
     blocks = {}
@@ -120,12 +230,19 @@ def parse_transitions_for_state(state_name, block_text):
     """Return a list of (to_state, condition) tuples for one state block."""
     transitions = []
 
-    keyword_matches = list(KEYWORD_TOKEN.finditer(block_text))
+    # Scan the comment-masked version throughout: a comment containing an
+    # English word like "if" or "else" must never be mistaken for real
+    # Verilog control flow. Masking preserves length/position exactly,
+    # and never alters real code, so every capture below is identical to
+    # what scanning block_text directly would give outside of comments.
+    masked_block = _mask_comments(block_text)
+
+    keyword_matches = list(KEYWORD_TOKEN.finditer(masked_block))
 
     if not keyword_matches:
         # No if/else at all in this block -- expect at most one
         # unconditional assignment.
-        assigns = ASSIGNMENT.findall(block_text)
+        assigns = ASSIGNMENT.findall(masked_block)
         if len(assigns) == 1:
             transitions.append((assigns[0], "unconditional"))
         elif len(assigns) == 0:
@@ -151,28 +268,28 @@ def parse_transitions_for_state(state_name, block_text):
             condition = "else"
             segment_start = kw.end()
         else:
-            paren_start = block_text.find("(", kw.end())
+            paren_start = masked_block.find("(", kw.end())
             next_kw_start = (
                 keyword_matches[i + 1].start()
                 if i + 1 < len(keyword_matches)
-                else len(block_text)
+                else len(masked_block)
             )
             if paren_start == -1 or paren_start > next_kw_start:
                 parse_ok = False
                 continue
-            paren_end = find_matching_paren(block_text, paren_start)
+            paren_end = find_matching_paren(masked_block, paren_start)
             if paren_end is None:
                 parse_ok = False
                 continue
-            condition = block_text[paren_start + 1 : paren_end].strip()
+            condition = masked_block[paren_start + 1 : paren_end].strip()
             segment_start = paren_end + 1
 
         segment_end = (
             keyword_matches[i + 1].start()
             if i + 1 < len(keyword_matches)
-            else len(block_text)
+            else len(masked_block)
         )
-        segments.append((condition, block_text[segment_start:segment_end]))
+        segments.append((condition, masked_block[segment_start:segment_end]))
 
     if not parse_ok:
         print(
@@ -254,7 +371,41 @@ def check_deadlocks(graph, reset_state):
     return deadlocks
 
 
-def print_report(filename, states, reset_state, unreachable, deadlocks):
+def score_severity(state_name, graph):
+    """Score a deadlocked state's severity.
+
+    HIGH:   3+ other states have a transition into it, OR its name puts
+            it on a critical write/read path ("wdata", "rdata",
+            "wr_resp") — either condition alone is enough for HIGH.
+    MEDIUM: 1-2 other states transition into it.
+    LOW:    no other state transitions into it (only reachable from
+            reset, or self-looping).
+
+    This is purely a reporting-layer annotation computed from the
+    already-detected deadlock list; it does not change which states
+    check_deadlocks() flags.
+    """
+    critical_path_hint = any(
+        token in state_name.lower() for token in ("wdata", "rdata", "wr_resp")
+    )
+    if critical_path_hint:
+        return "HIGH"
+
+    incoming_states = set()
+    for source_state, transitions in graph.items():
+        if source_state == state_name:
+            continue
+        if any(to_state == state_name for to_state, _cond in transitions):
+            incoming_states.add(source_state)
+
+    if len(incoming_states) >= 3:
+        return "HIGH"
+    if len(incoming_states) >= 1:
+        return "MEDIUM"
+    return "LOW"
+
+
+def print_report(filename, states, reset_state, unreachable, deadlocks, graph):
     print("=== FSM Analysis Report ===")
     print(f"File: {filename}")
     print(f"States found: {len(states)}")
@@ -267,7 +418,7 @@ def print_report(filename, states, reset_state, unreachable, deadlocks):
     else:
         for state_name in unreachable:
             print(f"[WARN] Unreachable state: {state_name}")
-            print(f"       No path from 'idle' to '{state_name}' exists.")
+            print(f"       No path from '{reset_state}' to '{state_name}' exists.")
     print()
 
     print("--- Deadlock Detection ---")
@@ -275,7 +426,8 @@ def print_report(filename, states, reset_state, unreachable, deadlocks):
         print("[PASS] No deadlocks detected.")
     else:
         for state_name, condition in deadlocks:
-            print(f"[WARN] Potential deadlock: state '{state_name}'")
+            severity = score_severity(state_name, graph)
+            print(f"[WARN] Potential deadlock: state '{state_name}'  [SEVERITY: {severity}]")
             print(f"       Blocking condition: {condition}")
             print(
                 f"       Failure scenario: If {condition} never asserts while"
@@ -288,26 +440,64 @@ def print_report(filename, states, reset_state, unreachable, deadlocks):
     print(f"=== Summary: {total_warnings} warning(s) found ===")
 
 
+def find_module_names(text):
+    """Return every `module <name>` declaration in a Verilog source
+    file, in order of appearance."""
+    return re.findall(r"\bmodule\s+(\w+)\b", text)
+
+
 def parse_fsm(filepath):
-    """Read a Verilog file and extract (states, reset_state, graph) for
-    TARGET_MODULE. Returns (None, None, None) if the module isn't found."""
+    """Read a Verilog file and extract every FSM it contains.
+
+    A module counts as an FSM only if it has both localparam state
+    definitions AND a case(state) block; anything else (testbenches,
+    wrapper/instantiation-only modules, modules with unrelated case
+    statements) is silently skipped — it's not an FSM to analyze.
+
+    Returns a list of dicts, one per FSM module found:
+        [{"module_name": ..., "states": {...}, "reset_state": ...,
+          "graph": {...}}, ...]
+    (possibly empty, if the file has no FSM modules at all).
+    """
     with open(filepath, "r") as f:
         text = f.read()
 
-    module_body = extract_module_body(text, TARGET_MODULE)
-    if module_body is None:
-        return None, None, None
+    results = []
+    for module_name in find_module_names(text):
+        module_body = extract_module_body(text, module_name)
+        if module_body is None:
+            continue
 
-    states = extract_states(module_body)
-    reset_state = extract_reset_state(module_body)
-    case_block = extract_case_block(module_body)
+        states = extract_states(module_body)
+        if not states:
+            continue
 
-    if case_block is None:
-        graph = {name: [] for name in states}
-    else:
+        case_block = extract_case_block(module_body)
+        if case_block is None:
+            continue
+
+        reset_state = extract_reset_state(module_body, states)
         graph = build_graph(case_block, list(states.keys()))
 
-    return states, reset_state, graph
+        results.append(
+            {
+                "module_name": module_name,
+                "states": states,
+                "reset_state": reset_state,
+                "graph": graph,
+            }
+        )
+
+    return results
+
+
+def get_fsm(fsm_list, module_name):
+    """Return the {"module_name", "states", "reset_state", "graph"}
+    dict for one module out of parse_fsm()'s result list, or None."""
+    for entry in fsm_list:
+        if entry["module_name"] == module_name:
+            return entry
+    return None
 
 
 def analyze_and_report(filepath, states, reset_state, graph):
@@ -315,7 +505,7 @@ def analyze_and_report(filepath, states, reset_state, graph):
     the list of (state_name, condition) deadlocks found."""
     unreachable = check_reachability(graph, reset_state, list(states.keys()))
     deadlocks = check_deadlocks(graph, reset_state)
-    print_report(filepath, states, reset_state, unreachable, deadlocks)
+    print_report(filepath, states, reset_state, unreachable, deadlocks, graph)
     return deadlocks
 
 
@@ -353,28 +543,53 @@ def find_matching_end(text, begin_idx):
     return None
 
 
-def locate_state_block_span(source, state_name, state_names):
+def locate_state_block_span(source, state_name, state_names, module_name=TARGET_MODULE):
     """Find the (start, end) character span of a state's full case-label
-    block ("state_name: begin ... end") within `source`.
+    block ("state_name: begin ... end") within `source`, scoped to
+    `module_name`'s case(state) block specifically.
 
-    Returns None if the state isn't found. Returns the string "grouped"
-    if the state shares a comma-joined case label with other states
-    (e.g. "no_ack_wdata, no_ack_waddr:") — callers should refuse to
-    surgically edit such a block, since doing so would also touch the
-    other state(s) sharing it.
+    Scoping to one module matters as soon as a file has more than one
+    FSM: without it, this would always find the *first* case(state) in
+    the whole file, silently editing the wrong module whenever the
+    target state belongs to a later one.
+
+    Returns None if the module or the state isn't found. Returns the
+    string "grouped" if the state shares a comma-joined case label with
+    other states (e.g. "no_ack_wdata, no_ack_waddr:") — callers should
+    refuse to surgically edit such a block, since doing so would also
+    touch the other state(s) sharing it.
     """
-    case_match = re.search(r"case\s*\(\s*state\s*\)(.*?)endcase", source, re.DOTALL)
-    if not case_match:
+    masked_source = _mask_comments(source)
+
+    module_match = re.search(
+        r"\bmodule\s+" + re.escape(module_name) + r"\b(.*?)\bendmodule\b",
+        masked_source,
+        re.DOTALL,
+    )
+    if not module_match:
         return None
-    case_start, case_end = case_match.start(1), case_match.end(1)
+    module_start = module_match.start(1)
+    masked_module_text = masked_source[module_start : module_match.end(1)]
+
+    case_open_match = re.search(r"case\s*\(\s*state\s*\)", masked_module_text)
+    if not case_open_match:
+        return None
+    case_content_start = case_open_match.end()
+    end_span = find_matching_endcase(masked_module_text, case_open_match.start())
+    if end_span is None:
+        return None
+    case_endcase_start, _case_endcase_end = end_span
+
+    case_start = module_start + case_content_start
+    case_end = module_start + case_endcase_start
 
     names_alt = "|".join(re.escape(s) for s in state_names)
     label_pattern = re.compile(
         r"((?:(?:" + names_alt + r")\s*,\s*)*(?:" + names_alt + r"))\s*:"
     )
-    labels = list(label_pattern.finditer(source, case_start, case_end))
+    labels = list(label_pattern.finditer(masked_source, case_start, case_end))
 
-    default_match = re.search(r"\bdefault\s*:", source[case_start:case_end])
+    default_match = re.search(r"\bdefault\s*:", masked_source[case_start:case_end])
     boundary = case_start + default_match.start() if default_match else case_end
 
     for i, lm in enumerate(labels):
@@ -410,35 +625,38 @@ def _pick_timeout_counter(state_name, fsm_source):
     return "timeout_count"
 
 
-def _template_fix(state_name, condition, fsm_source):
+def _template_fix(state_name, condition, fsm_source, module_name=TARGET_MODULE):
     """Deterministic fallback fix: reuse this FSM's existing '== 15'
     timeout-counter pattern to add a timeout escape to a state whose
     only exit is a handshake condition. Returns None if the state's
     block doesn't have the simple "if (...) begin ... end" shape this
     template can safely extend.
     """
-    module_body = extract_module_body(fsm_source, TARGET_MODULE)
+    module_body = extract_module_body(fsm_source, module_name)
     if module_body is None:
         return None
     states = extract_states(module_body)
-    reset_state = extract_reset_state(module_body) or "idle"
+    reset_state = extract_reset_state(module_body, states) or "idle"
 
-    span = locate_state_block_span(fsm_source, state_name, list(states.keys()))
+    span = locate_state_block_span(
+        fsm_source, state_name, list(states.keys()), module_name=module_name
+    )
     if not isinstance(span, tuple):
         return None
     original_block = fsm_source[span[0] : span[1]]
+    masked_block = _mask_comments(original_block)
 
-    if_match = re.search(r"\bif\s*\(", original_block)
+    if_match = re.search(r"\bif\s*\(", masked_block)
     if not if_match:
         return None
-    paren_start = original_block.find("(", if_match.start())
-    paren_end = find_matching_paren(original_block, paren_start)
+    paren_start = masked_block.find("(", if_match.start())
+    paren_end = find_matching_paren(masked_block, paren_start)
     if paren_end is None:
         return None
-    begin_idx = original_block.find("begin", paren_end)
+    begin_idx = masked_block.find("begin", paren_end)
     if begin_idx == -1:
         return None
-    end_span = find_matching_end(original_block, begin_idx)
+    end_span = find_matching_end(masked_block, begin_idx)
     if end_span is None:
         return None
     inner_end_start, inner_end_end = end_span
@@ -518,7 +736,7 @@ def _call_anthropic(prompt, api_key):
     return message.content[0].text.strip()
 
 
-def generate_fix(state_name, condition, fsm_source):
+def generate_fix(state_name, condition, fsm_source, module_name=TARGET_MODULE):
     """Generate a targeted fix for one deadlocked state block.
 
     Provider order: Groq (GROQ_API_KEY) first, then Anthropic
@@ -528,6 +746,10 @@ def generate_fix(state_name, condition, fsm_source):
     failed call — a live demo shouldn't go down over a network blip or
     a missing key. Whichever path is used is always announced on
     stdout, so the fallback is never mistaken for a live LLM result.
+
+    `module_name` only matters for the template fallback, which needs
+    to know which module's case(state) block to locate the state in
+    when a file has more than one FSM.
 
     Returns (fixed_block, provider) where provider is one of "groq",
     "anthropic", or "template".
@@ -561,7 +783,7 @@ def generate_fix(state_name, condition, fsm_source):
     else:
         print("[FIX ENGINE] Falling back to deterministic template fix.")
 
-    fixed_block = _template_fix(state_name, condition, fsm_source)
+    fixed_block = _template_fix(state_name, condition, fsm_source, module_name=module_name)
     if fixed_block is None:
         raise RuntimeError(
             f"Could not generate a fix for state '{state_name}' "
@@ -596,7 +818,7 @@ def _fix_description(provider):
     return f"LLM-generated timeout escape fix (via {provider})"
 
 
-def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
+def apply_fix(filepath, state_name, fixed_block, output_filepath=None, module_name=TARGET_MODULE):
     """Surgically replace only `state_name`'s case-label block in the
     file at `filepath` with `fixed_block`, and write the result to
     `output_filepath` (default: <filepath without .v>_fixed.v).
@@ -608,13 +830,15 @@ def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
     with open(filepath, "r") as f:
         source = f.read()
 
-    module_body = extract_module_body(source, TARGET_MODULE)
+    module_body = extract_module_body(source, module_name)
     if module_body is None:
-        print(f"[ERROR] Module '{TARGET_MODULE}' not found in {filepath}")
+        print(f"[ERROR] Module '{module_name}' not found in {filepath}")
         return None
     states = extract_states(module_body)
 
-    span = locate_state_block_span(source, state_name, list(states.keys()))
+    span = locate_state_block_span(
+        source, state_name, list(states.keys()), module_name=module_name
+    )
     if span is None:
         print(
             f"[ERROR] Could not locate '{state_name}' block in source "
@@ -636,7 +860,7 @@ def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
         source[:start] + fixed_block.strip() + trailing_whitespace + source[end:]
     )
 
-    fixed_module_body = extract_module_body(fixed_source, TARGET_MODULE)
+    fixed_module_body = extract_module_body(fixed_source, module_name)
     if fixed_module_body is None:
         print(
             f"[ERROR] Surgical fix for '{state_name}' produced an "
@@ -661,7 +885,7 @@ def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
     return output_filepath
 
 
-def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
+def fix_and_verify(filepath, deadlocks, graph, states, reset_state, module_name=TARGET_MODULE):
     """Generate, show, and apply a fix for every detected deadlock, then
     re-run the full analysis on the fixed file to verify it worked.
 
@@ -684,11 +908,15 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
         with open(current_read_path, "r") as f:
             fsm_source = f.read()
 
-        fixed_block, provider = generate_fix(state_name, condition, fsm_source)
+        fixed_block, provider = generate_fix(
+            state_name, condition, fsm_source, module_name=module_name
+        )
 
-        module_body = extract_module_body(fsm_source, TARGET_MODULE)
+        module_body = extract_module_body(fsm_source, module_name)
         cur_states = extract_states(module_body) if module_body else {}
-        span = locate_state_block_span(fsm_source, state_name, list(cur_states.keys()))
+        span = locate_state_block_span(
+            fsm_source, state_name, list(cur_states.keys()), module_name=module_name
+        )
         if isinstance(span, tuple):
             original_block = fsm_source[span[0] : span[1]]
         else:
@@ -700,7 +928,11 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
         print("--- END DIFF ---\n")
 
         result_path = apply_fix(
-            current_read_path, state_name, fixed_block, output_filepath=output_filepath
+            current_read_path,
+            state_name,
+            fixed_block,
+            output_filepath=output_filepath,
+            module_name=module_name,
         )
         if not result_path:
             print(f"[ERROR] Fix application failed for '{state_name}'")
@@ -717,11 +949,14 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
 
     print("\n[VERIFY] Re-running analysis on fixed file...")
     print("=" * 50)
-    fixed_states, fixed_reset, fixed_graph = parse_fsm(output_filepath)
-    if fixed_states is None:
+    fixed_fsms = parse_fsm(output_filepath)
+    fixed_entry = get_fsm(fixed_fsms, module_name)
+    if fixed_entry is None:
         print(f"[ERROR] Could not parse fixed file {output_filepath}")
         return None
-    fixed_deadlocks = analyze_and_report(output_filepath, fixed_states, fixed_reset, fixed_graph)
+    fixed_deadlocks = analyze_and_report(
+        output_filepath, fixed_entry["states"], fixed_entry["reset_state"], fixed_entry["graph"]
+    )
     return output_filepath, fixed_deadlocks, fixes_applied
 
 
@@ -733,15 +968,32 @@ def main():
     filepath = sys.argv[1]
     auto_fix = "--fix" in sys.argv
 
-    states, reset_state, graph = parse_fsm(filepath)
-    if states is None:
-        print(f"[ERROR] Module '{TARGET_MODULE}' not found in {filepath}")
+    fsms = parse_fsm(filepath)
+    if not fsms:
+        print(f"[ERROR] No FSM found in {filepath}")
         sys.exit(1)
 
+    # Prefer TARGET_MODULE when present, so behavior on axi_master.v is
+    # exactly what it always was. Otherwise this file has no module by
+    # that name — fall back to the one FSM found (or, if several, the
+    # first one, noting the others) so the CLI works on any Verilog
+    # file, not only axi_master.v.
+    target = get_fsm(fsms, TARGET_MODULE)
+    if target is None:
+        if len(fsms) > 1:
+            other_names = ", ".join(f["module_name"] for f in fsms)
+            print(
+                f"[INFO] Module '{TARGET_MODULE}' not found; multiple FSMs "
+                f"present ({other_names}). Analyzing '{fsms[0]['module_name']}'."
+            )
+        target = fsms[0]
+
+    module_name = target["module_name"]
+    states, reset_state, graph = target["states"], target["reset_state"], target["graph"]
     deadlocks = analyze_and_report(filepath, states, reset_state, graph)
 
     if auto_fix and deadlocks:
-        fix_and_verify(filepath, deadlocks, graph, states, reset_state)
+        fix_and_verify(filepath, deadlocks, graph, states, reset_state, module_name=module_name)
     elif deadlocks:
         print("\n[INFO] Run with --fix flag to automatically generate and apply fixes.")
 

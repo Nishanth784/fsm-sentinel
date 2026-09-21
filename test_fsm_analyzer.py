@@ -13,31 +13,26 @@ import requests
 
 from fsm_analyzer import (
     TARGET_MODULE,
-    build_graph,
     check_deadlocks,
     check_reachability,
-    extract_case_block,
-    extract_module_body,
-    extract_reset_state,
-    extract_states,
     fix_and_verify,
+    get_fsm,
     parse_fsm,
+    score_severity,
 )
 
 FILENAME = "axi_master.v"
+UNREACHABLE_FILENAME = "test_cases/unreachable_fsm.v"
 EXPECTED_STATE_COUNT = 14
 API_BASE = "http://localhost:8000"
 
 
 def load():
-    with open(FILENAME, "r") as f:
-        text = f.read()
-    module_body = extract_module_body(text, TARGET_MODULE)
-    states = extract_states(module_body)
-    reset_state = extract_reset_state(module_body)
-    case_block = extract_case_block(module_body)
-    graph = build_graph(case_block, list(states.keys()))
-    return states, reset_state, graph
+    """Load axi_master's FSM data from axi_master.v via parse_fsm
+    (which now returns a list of every FSM module in the file)."""
+    fsms = parse_fsm(FILENAME)
+    entry = get_fsm(fsms, TARGET_MODULE)
+    return entry["states"], entry["reset_state"], entry["graph"]
 
 
 def test_fix_engine():
@@ -45,15 +40,19 @@ def test_fix_engine():
     confirm the fixed file reports 0 warnings. Output from the fix
     engine itself is suppressed to keep the test log readable; the
     assertion is on its return value, not its printed report."""
-    states, reset_state, graph = parse_fsm(FILENAME)
-    if states is None:
+    fsms = parse_fsm(FILENAME)
+    entry = get_fsm(fsms, TARGET_MODULE)
+    if entry is None:
         return False
+    states, reset_state, graph = entry["states"], entry["reset_state"], entry["graph"]
     deadlocks = check_deadlocks(graph, reset_state)
     if not deadlocks:
         return False
 
     with contextlib.redirect_stdout(io.StringIO()):
-        result = fix_and_verify(FILENAME, deadlocks, graph, states, reset_state)
+        result = fix_and_verify(
+            FILENAME, deadlocks, graph, states, reset_state, module_name=TARGET_MODULE
+        )
 
     if result is None:
         return False
@@ -90,6 +89,13 @@ def _ensure_api_server():
     raise RuntimeError("API server did not start within 15s")
 
 
+def _find_result(results, module_name):
+    for r in results:
+        if r.get("module_name") == module_name:
+            return r
+    return None
+
+
 def test_api_analyze():
     """[TEST 8] /analyze returns correct JSON with wdata_last deadlock"""
     with open(FILENAME, "rb") as f:
@@ -97,22 +103,28 @@ def test_api_analyze():
     if resp.status_code != 200:
         return False
     data = resp.json()
-    deadlock_states = {d["state"] for d in data.get("deadlocks", [])}
+    axi_master_result = _find_result(data.get("results", []), TARGET_MODULE)
+    if axi_master_result is None:
+        return False
+    deadlock_states = {d["state"] for d in axi_master_result.get("deadlocks", [])}
     return (
         "wdata_last" in deadlock_states
-        and data.get("summary", {}).get("total_warnings") == 1
-        and data.get("states_found") == EXPECTED_STATE_COUNT
+        and axi_master_result.get("summary", {}).get("total_warnings") == 1
+        and axi_master_result.get("states_found") == EXPECTED_STATE_COUNT
     )
 
 
 def test_api_fix():
-    """[TEST 9] /fix returns warnings_after: 0"""
+    """[TEST 9] /fix returns warnings_after: 0 for axi_master's deadlock"""
     with open(FILENAME, "rb") as f:
         resp = requests.post(f"{API_BASE}/fix", files={"file": (FILENAME, f, "text/plain")})
     if resp.status_code != 200:
         return False
     data = resp.json()
-    verification = data.get("verification", {})
+    axi_master_result = _find_result(data.get("results", []), TARGET_MODULE)
+    if axi_master_result is None:
+        return False
+    verification = axi_master_result.get("verification", {})
     return verification.get("warnings_after") == 0 and bool(data.get("fixed_file_content"))
 
 
@@ -132,15 +144,97 @@ def test_api_download():
             tmp.write(content)
             tmp_path = tmp.name
 
-        states, reset_state, graph = parse_fsm(tmp_path)
-        if states is None:
+        fsms = parse_fsm(tmp_path)
+        entry = get_fsm(fsms, TARGET_MODULE)
+        if entry is None:
             return False
+        states, reset_state, graph = entry["states"], entry["reset_state"], entry["graph"]
         deadlocks = check_deadlocks(graph, reset_state)
         unreachable = check_reachability(graph, reset_state, list(states.keys()))
         return len(states) == EXPECTED_STATE_COUNT and not deadlocks and not unreachable
     finally:
         if tmp_path:
             os.remove(tmp_path)
+
+
+def test_api_visualize():
+    """[TEST 11] /visualize returns correct node types — wdata_last is
+    deadlock, idle is reset, 14 nodes total (for axi_master specifically)."""
+    with open(FILENAME, "rb") as f:
+        resp = requests.post(f"{API_BASE}/visualize", files={"file": (FILENAME, f, "text/plain")})
+    if resp.status_code != 200:
+        return False
+    data = resp.json()
+    modules = data.get("modules", [])
+    axi_master_module = next((m for m in modules if m.get("module_name") == TARGET_MODULE), None)
+    if axi_master_module is None:
+        return False
+
+    nodes = axi_master_module.get("nodes", [])
+    if len(nodes) != EXPECTED_STATE_COUNT:
+        return False
+
+    node_types = {n["id"]: n["type"] for n in nodes}
+    if node_types.get("wdata_last") != "deadlock":
+        return False
+    if node_types.get("idle") != "reset":
+        return False
+
+    edges = axi_master_module.get("edges", [])
+    # Every transition in the analyzer's graph must appear as an edge;
+    # cross-check against the CLI-facing graph directly rather than
+    # trusting the endpoint's own edge count.
+    fsms = parse_fsm(FILENAME)
+    entry = get_fsm(fsms, TARGET_MODULE)
+    expected_edge_count = sum(len(transitions) for transitions in entry["graph"].values())
+    return len(edges) == expected_edge_count
+
+
+def test_multi_fsm_analyze():
+    """[TEST 12] /analyze on axi_master.v finds 2 FSMs — axi_master and axi4_slave"""
+    with open(FILENAME, "rb") as f:
+        resp = requests.post(f"{API_BASE}/analyze", files={"file": (FILENAME, f, "text/plain")})
+    if resp.status_code != 200:
+        return False
+    data = resp.json()
+    if data.get("modules_found") != 2:
+        return False
+    results = data.get("results", [])
+    axi_master_result = _find_result(results, "axi_master")
+    axi4_slave_result = _find_result(results, "axi4_slave")
+    if axi_master_result is None or axi4_slave_result is None:
+        return False
+    return (
+        len(axi_master_result.get("deadlocks", [])) == 1
+        and len(axi4_slave_result.get("deadlocks", [])) == 0
+    )
+
+
+def test_severity_wdata_last():
+    """[TEST 13] wdata_last scores HIGH severity"""
+    fsms = parse_fsm(FILENAME)
+    entry = get_fsm(fsms, TARGET_MODULE)
+    if entry is None:
+        return False
+    return score_severity("wdata_last", entry["graph"]) == "HIGH"
+
+
+def test_unreachable_fsm_file():
+    """[TEST 14] unreachable_fsm.v — 'orphan' state flagged as
+    unreachable, no deadlocks detected"""
+    fsms = parse_fsm(UNREACHABLE_FILENAME)
+    if len(fsms) != 1:
+        return False
+    entry = fsms[0]
+    states, reset_state, graph = entry["states"], entry["reset_state"], entry["graph"]
+    unreachable = check_reachability(graph, reset_state, list(states.keys()))
+    deadlocks = check_deadlocks(graph, reset_state)
+    return (
+        entry["module_name"] == "unreachable_fsm"
+        and reset_state == "idle"
+        and unreachable == ["orphan"]
+        and deadlocks == []
+    )
 
 
 def main():
@@ -205,14 +299,42 @@ def main():
             "[TEST 10] /download returns a valid fixed Verilog file",
             test_api_download(),
         ))
+
+        results.append((
+            "[TEST 11] /visualize returns correct node types — wdata_last is "
+            "deadlock, idle is reset, 14 nodes total",
+            test_api_visualize(),
+        ))
+
+        results.append((
+            "[TEST 12] /analyze on axi_master.v finds 2 FSMs — axi_master "
+            "(1 deadlock) and axi4_slave (0 deadlocks)",
+            test_multi_fsm_analyze(),
+        ))
     except RuntimeError as exc:
-        results.append((f"[TEST 8] /analyze returns correct JSON with wdata_last deadlock ({exc})", False))
-        results.append((f"[TEST 9] /fix returns warnings_after: 0 ({exc})", False))
-        results.append((f"[TEST 10] /download returns a valid fixed Verilog file ({exc})", False))
+        for n, label in (
+            (8, "/analyze returns correct JSON with wdata_last deadlock"),
+            (9, "/fix returns warnings_after: 0"),
+            (10, "/download returns a valid fixed Verilog file"),
+            (11, "/visualize returns correct node types"),
+            (12, "/analyze on axi_master.v finds 2 FSMs"),
+        ):
+            results.append((f"[TEST {n}] {label} ({exc})", False))
     finally:
         if api_proc is not None:
             api_proc.terminate()
             api_proc.wait(timeout=5)
+
+    results.append((
+        "[TEST 13] wdata_last scores HIGH severity",
+        test_severity_wdata_last(),
+    ))
+
+    results.append((
+        "[TEST 14] unreachable_fsm.v — 'orphan' state flagged as "
+        "unreachable, no deadlocks detected",
+        test_unreachable_fsm_file(),
+    ))
 
     all_passed = True
     for label, passed in results:
