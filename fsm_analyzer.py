@@ -3,6 +3,8 @@
 potential deadlocks. Uses only the stdlib `re` module; no Verilog parser
 library, no graph library."""
 
+import difflib
+import os
 import re
 import sys
 from collections import deque
@@ -286,19 +288,15 @@ def print_report(filename, states, reset_state, unreachable, deadlocks):
     print(f"=== Summary: {total_warnings} warning(s) found ===")
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python fsm_analyzer.py <verilog_file>")
-        sys.exit(1)
-
-    filename = sys.argv[1]
-    with open(filename, "r") as f:
+def parse_fsm(filepath):
+    """Read a Verilog file and extract (states, reset_state, graph) for
+    TARGET_MODULE. Returns (None, None, None) if the module isn't found."""
+    with open(filepath, "r") as f:
         text = f.read()
 
     module_body = extract_module_body(text, TARGET_MODULE)
     if module_body is None:
-        print(f"[ERROR] Module '{TARGET_MODULE}' not found in {filename}")
-        sys.exit(1)
+        return None, None, None
 
     states = extract_states(module_body)
     reset_state = extract_reset_state(module_body)
@@ -309,10 +307,372 @@ def main():
     else:
         graph = build_graph(case_block, list(states.keys()))
 
+    return states, reset_state, graph
+
+
+def analyze_and_report(filepath, states, reset_state, graph):
+    """Run reachability + deadlock checks, print the report, and return
+    the list of (state_name, condition) deadlocks found."""
     unreachable = check_reachability(graph, reset_state, list(states.keys()))
     deadlocks = check_deadlocks(graph, reset_state)
+    print_report(filepath, states, reset_state, unreachable, deadlocks)
+    return deadlocks
 
-    print_report(filename, states, reset_state, unreachable, deadlocks)
+
+# =====================================================================
+# Fix engine
+# =====================================================================
+#
+# When a deadlock is detected, generate_fix() asks an LLM for a targeted
+# fix to just that state's block. If ANTHROPIC_API_KEY isn't set, or the
+# 'anthropic' package isn't installed, or the API call itself fails, it
+# falls back to a deterministic template fix instead of failing the
+# whole workflow — a live demo should not go down because of a network
+# blip or a missing key. The fallback is always clearly labeled in the
+# output so it's never mistaken for a live LLM result.
+#
+# Whatever the source, the fix is never trusted blindly: apply_fix()
+# re-parses the edited file and checks the state set is unchanged before
+# writing it out, and fix_and_verify() re-runs the full analysis on the
+# result to confirm the deadlock is actually gone.
+
+BEGIN_END_TOKEN = re.compile(r"\bbegin\b|\bend\b")
+
+
+def find_matching_end(text, begin_idx):
+    """Given text[begin_idx:] starting at a 'begin' token, return the
+    (start, end) span of its matching 'end' token."""
+    depth = 0
+    for m in BEGIN_END_TOKEN.finditer(text, begin_idx):
+        if m.group(0) == "begin":
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return m.start(), m.end()
+    return None
+
+
+def locate_state_block_span(source, state_name, state_names):
+    """Find the (start, end) character span of a state's full case-label
+    block ("state_name: begin ... end") within `source`.
+
+    Returns None if the state isn't found. Returns the string "grouped"
+    if the state shares a comma-joined case label with other states
+    (e.g. "no_ack_wdata, no_ack_waddr:") — callers should refuse to
+    surgically edit such a block, since doing so would also touch the
+    other state(s) sharing it.
+    """
+    case_match = re.search(r"case\s*\(\s*state\s*\)(.*?)endcase", source, re.DOTALL)
+    if not case_match:
+        return None
+    case_start, case_end = case_match.start(1), case_match.end(1)
+
+    names_alt = "|".join(re.escape(s) for s in state_names)
+    label_pattern = re.compile(
+        r"((?:(?:" + names_alt + r")\s*,\s*)*(?:" + names_alt + r"))\s*:"
+    )
+    labels = list(label_pattern.finditer(source, case_start, case_end))
+
+    default_match = re.search(r"\bdefault\s*:", source[case_start:case_end])
+    boundary = case_start + default_match.start() if default_match else case_end
+
+    for i, lm in enumerate(labels):
+        names = [n.strip() for n in lm.group(1).split(",")]
+        if state_name not in names:
+            continue
+        if len(names) > 1:
+            return "grouped"
+        block_start = lm.start()
+        block_end = labels[i + 1].start() if i + 1 < len(labels) else boundary
+        block_end = min(block_end, boundary)
+        return block_start, block_end
+
+    return None
+
+
+def _pick_timeout_counter(state_name, fsm_source):
+    """Guess which existing timeout counter to reuse for a fallback fix,
+    based on naming conventions already used elsewhere in the FSM."""
+    counters = re.findall(r"(\w*_count)\s*==\s*15", fsm_source)
+    lower_state = state_name.lower()
+    write_hint = any(t in lower_state for t in ("wdata", "waddr", "wr", "bvalid", "bresp"))
+    read_hint = any(t in lower_state for t in ("rdata", "raddr", "rd"))
+
+    for c in counters:
+        if write_hint and "wr" in c:
+            return c
+    for c in counters:
+        if read_hint and "rd" in c:
+            return c
+    if counters:
+        return counters[0]
+    return "timeout_count"
+
+
+def _template_fix(state_name, condition, fsm_source):
+    """Deterministic fallback fix: reuse this FSM's existing '== 15'
+    timeout-counter pattern to add a timeout escape to a state whose
+    only exit is a handshake condition. Returns None if the state's
+    block doesn't have the simple "if (...) begin ... end" shape this
+    template can safely extend.
+    """
+    module_body = extract_module_body(fsm_source, TARGET_MODULE)
+    if module_body is None:
+        return None
+    states = extract_states(module_body)
+    reset_state = extract_reset_state(module_body) or "idle"
+
+    span = locate_state_block_span(fsm_source, state_name, list(states.keys()))
+    if not isinstance(span, tuple):
+        return None
+    original_block = fsm_source[span[0] : span[1]]
+
+    if_match = re.search(r"\bif\s*\(", original_block)
+    if not if_match:
+        return None
+    paren_start = original_block.find("(", if_match.start())
+    paren_end = find_matching_paren(original_block, paren_start)
+    if paren_end is None:
+        return None
+    begin_idx = original_block.find("begin", paren_end)
+    if begin_idx == -1:
+        return None
+    end_span = find_matching_end(original_block, begin_idx)
+    if end_span is None:
+        return None
+    inner_end_start, inner_end_end = end_span
+
+    line_start = original_block.rfind("\n", 0, inner_end_start) + 1
+    base_indent = re.match(r"[ \t]*", original_block[line_start:inner_end_start]).group(0)
+    stmt_indent = base_indent + "    "
+
+    counter = _pick_timeout_counter(state_name, fsm_source)
+    insertion = (
+        f" else if ({counter} == 15) begin\n"
+        f"{stmt_indent}state <= {reset_state};\n"
+        f"{stmt_indent}{counter} <= 0;\n"
+        f"{base_indent}end else begin\n"
+        f"{stmt_indent}{counter} <= {counter} + 1;\n"
+        f"{base_indent}end"
+    )
+
+    return original_block[:inner_end_end] + insertion + original_block[inner_end_end:]
+
+
+def generate_fix(state_name, condition, fsm_source):
+    """Generate a targeted fix for one deadlocked state block.
+
+    Tries the Anthropic API first when ANTHROPIC_API_KEY is set; falls
+    back to a deterministic template fix (reusing this FSM's own '== 15'
+    timeout pattern) whenever the API isn't available or fails. The
+    fallback path is always announced on stdout so it's never confused
+    with a live LLM result.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    if api_key:
+        try:
+            import anthropic
+        except ImportError:
+            print(
+                "[FIX ENGINE] 'anthropic' package not installed — "
+                "using deterministic template fix (no live LLM call)."
+            )
+        else:
+            prompt = f"""You are a hardware verification expert fixing a deadlock in a Verilog FSM.
+
+The FSM has a deadlocked state: '{state_name}'
+The only exit condition is: {condition}
+There is no timeout escape. If the condition never asserts, the FSM stalls forever.
+
+Here is the full FSM source:
+{fsm_source}
+
+Generate ONLY the fixed version of the '{state_name}' state block.
+The fix must add a timeout escape using the same counter pattern already used in other states of this FSM.
+Look at how other states use timeout counters (== 15 pattern) and apply the same pattern here.
+
+Rules:
+- Change ONLY the '{state_name}' state block
+- Do not modify any other state
+- Do not add new signals or parameters
+- Use only signals already present in the FSM
+- Output only the fixed state block, nothing else, no explanation, no markdown
+"""
+            try:
+                client = anthropic.Anthropic(api_key=api_key)
+                message = client.messages.create(
+                    model="claude-sonnet-5",
+                    max_tokens=1000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return message.content[0].text.strip()
+            except Exception as exc:
+                print(
+                    f"[FIX ENGINE] LLM call failed ({exc}) — "
+                    f"using deterministic template fix."
+                )
+    else:
+        print(
+            "[FIX ENGINE] ANTHROPIC_API_KEY not set — using deterministic "
+            "template fix (no live LLM call)."
+        )
+
+    fixed_block = _template_fix(state_name, condition, fsm_source)
+    if fixed_block is None:
+        raise RuntimeError(
+            f"Could not generate a fix for state '{state_name}' "
+            f"(neither the LLM nor the template fallback produced one)"
+        )
+    return fixed_block
+
+
+def show_diff(original_block, fixed_block, state_name):
+    print(f"\n--- DIFF for state '{state_name}' ---")
+    diff = difflib.unified_diff(
+        original_block.splitlines(keepends=True),
+        fixed_block.splitlines(keepends=True),
+        fromfile=f"{state_name} (original)",
+        tofile=f"{state_name} (fixed)",
+        lineterm="",
+    )
+    for line in diff:
+        print(line)
+    print("--- END DIFF ---\n")
+
+
+def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
+    """Surgically replace only `state_name`'s case-label block in the
+    file at `filepath` with `fixed_block`, and write the result to
+    `output_filepath` (default: <filepath without .v>_fixed.v).
+
+    Before writing, re-parses the edited source and refuses to save if
+    the module's state set changed — a cheap sanity check that the
+    surgical edit didn't corrupt the FSM structure.
+    """
+    with open(filepath, "r") as f:
+        source = f.read()
+
+    module_body = extract_module_body(source, TARGET_MODULE)
+    if module_body is None:
+        print(f"[ERROR] Module '{TARGET_MODULE}' not found in {filepath}")
+        return None
+    states = extract_states(module_body)
+
+    span = locate_state_block_span(source, state_name, list(states.keys()))
+    if span is None:
+        print(
+            f"[ERROR] Could not locate '{state_name}' block in source "
+            f"for surgical replacement"
+        )
+        return None
+    if span == "grouped":
+        print(
+            f"[ERROR] '{state_name}' shares a case label with other "
+            f"states — skipping surgical fix to avoid corrupting them"
+        )
+        return None
+
+    start, end = span
+    original_slice = source[start:end]
+    stripped = original_slice.rstrip()
+    trailing_whitespace = original_slice[len(stripped):]
+    fixed_source = (
+        source[:start] + fixed_block.strip() + trailing_whitespace + source[end:]
+    )
+
+    fixed_module_body = extract_module_body(fixed_source, TARGET_MODULE)
+    if fixed_module_body is None:
+        print(
+            f"[ERROR] Surgical fix for '{state_name}' produced an "
+            f"unparsable module — not writing output"
+        )
+        return None
+    fixed_states = extract_states(fixed_module_body)
+    if set(fixed_states.keys()) != set(states.keys()):
+        print(
+            f"[ERROR] Surgical fix for '{state_name}' changed the FSM's "
+            f"state set — not writing output"
+        )
+        return None
+
+    if output_filepath is None:
+        output_filepath = filepath.replace(".v", "_fixed.v")
+
+    with open(output_filepath, "w") as f:
+        f.write(fixed_source)
+
+    print(f"[FIX APPLIED] Fixed file saved as: {output_filepath}")
+    return output_filepath
+
+
+def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
+    """Generate, show, and apply a fix for every detected deadlock, then
+    re-run the full analysis on the fixed file to verify it worked."""
+    if not deadlocks:
+        print("[INFO] No deadlocks to fix.")
+        return None
+
+    output_filepath = filepath.replace(".v", "_fixed.v")
+    current_read_path = filepath
+
+    for state_name, condition in deadlocks:
+        print(f"\n[FIX ENGINE] Generating fix for '{state_name}'...")
+
+        with open(current_read_path, "r") as f:
+            fsm_source = f.read()
+
+        fixed_block = generate_fix(state_name, condition, fsm_source)
+
+        module_body = extract_module_body(fsm_source, TARGET_MODULE)
+        cur_states = extract_states(module_body) if module_body else {}
+        span = locate_state_block_span(fsm_source, state_name, list(cur_states.keys()))
+        if isinstance(span, tuple):
+            original_block = fsm_source[span[0] : span[1]]
+        else:
+            original_block = "<could not locate original block>"
+
+        show_diff(original_block, fixed_block, state_name)
+
+        result_path = apply_fix(
+            current_read_path, state_name, fixed_block, output_filepath=output_filepath
+        )
+        if not result_path:
+            print(f"[ERROR] Fix application failed for '{state_name}'")
+            continue
+
+        current_read_path = result_path
+
+    print("\n[VERIFY] Re-running analysis on fixed file...")
+    print("=" * 50)
+    fixed_states, fixed_reset, fixed_graph = parse_fsm(output_filepath)
+    if fixed_states is None:
+        print(f"[ERROR] Could not parse fixed file {output_filepath}")
+        return None
+    fixed_deadlocks = analyze_and_report(output_filepath, fixed_states, fixed_reset, fixed_graph)
+    return output_filepath, fixed_deadlocks
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python fsm_analyzer.py <verilog_file> [--fix]")
+        sys.exit(1)
+
+    filepath = sys.argv[1]
+    auto_fix = "--fix" in sys.argv
+
+    states, reset_state, graph = parse_fsm(filepath)
+    if states is None:
+        print(f"[ERROR] Module '{TARGET_MODULE}' not found in {filepath}")
+        sys.exit(1)
+
+    deadlocks = analyze_and_report(filepath, states, reset_state, graph)
+
+    if auto_fix and deadlocks:
+        fix_and_verify(filepath, deadlocks, graph, states, reset_state)
+    elif deadlocks:
+        print("\n[INFO] Run with --fix flag to automatically generate and apply fixes.")
 
 
 if __name__ == "__main__":

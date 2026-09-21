@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Automated checks for fsm_analyzer.py against axi_master.v."""
 
+import contextlib
+import io
 import sys
 
 from fsm_analyzer import (
@@ -12,6 +14,8 @@ from fsm_analyzer import (
     extract_module_body,
     extract_reset_state,
     extract_states,
+    fix_and_verify,
+    parse_fsm,
 )
 
 FILENAME = "axi_master.v"
@@ -27,6 +31,27 @@ def load():
     case_block = extract_case_block(module_body)
     graph = build_graph(case_block, list(states.keys()))
     return states, reset_state, graph
+
+
+def test_fix_engine():
+    """Run the fix engine end-to-end (writes axi_master_fixed.v) and
+    confirm the fixed file reports 0 warnings. Output from the fix
+    engine itself is suppressed to keep the test log readable; the
+    assertion is on its return value, not its printed report."""
+    states, reset_state, graph = parse_fsm(FILENAME)
+    if states is None:
+        return False
+    deadlocks = check_deadlocks(graph, reset_state)
+    if not deadlocks:
+        return False
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = fix_and_verify(FILENAME, deadlocks, graph, states, reset_state)
+
+    if result is None:
+        return False
+    _fixed_filepath, fixed_deadlocks = result
+    return fixed_deadlocks == []
 
 
 def main():
@@ -66,6 +91,11 @@ def main():
         "[TEST 6] 'send_wdata' NOT flagged as deadlock (it has timeout "
         "escape at wr_count == 15)",
         "send_wdata" not in deadlock_states,
+    ))
+
+    results.append((
+        "[TEST 7] Fix engine — axi_master_fixed.v produces 0 warnings",
+        test_fix_engine(),
     ))
 
     all_passed = True
