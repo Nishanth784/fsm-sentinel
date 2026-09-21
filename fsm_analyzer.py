@@ -528,20 +528,23 @@ def generate_fix(state_name, condition, fsm_source):
     failed call — a live demo shouldn't go down over a network blip or
     a missing key. Whichever path is used is always announced on
     stdout, so the fallback is never mistaken for a live LLM result.
+
+    Returns (fixed_block, provider) where provider is one of "groq",
+    "anthropic", or "template".
     """
     prompt = _build_fix_prompt(state_name, condition, fsm_source)
 
     groq_key = os.environ.get("GROQ_API_KEY")
     if groq_key:
         try:
-            return _call_groq(prompt, groq_key)
+            return _call_groq(prompt, groq_key), "groq"
         except Exception as exc:
             print(f"[FIX ENGINE] Groq call failed ({exc}) — trying next provider.")
 
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if anthropic_key:
         try:
-            return _call_anthropic(prompt, anthropic_key)
+            return _call_anthropic(prompt, anthropic_key), "anthropic"
         except ImportError:
             print(
                 "[FIX ENGINE] 'anthropic' package not installed — "
@@ -564,21 +567,33 @@ def generate_fix(state_name, condition, fsm_source):
             f"Could not generate a fix for state '{state_name}' "
             f"(neither the LLM nor the template fallback produced one)"
         )
-    return fixed_block
+    return fixed_block, "template"
 
 
-def show_diff(original_block, fixed_block, state_name):
-    print(f"\n--- DIFF for state '{state_name}' ---")
-    diff = difflib.unified_diff(
-        original_block.splitlines(keepends=True),
-        fixed_block.splitlines(keepends=True),
+def build_diff_text(original_block, fixed_block, state_name):
+    """Return a unified diff string comparing the original and fixed
+    versions of one state block. Shared by show_diff (CLI) and api.py
+    (JSON responses) so the diff is built in exactly one place."""
+    diff_lines = difflib.unified_diff(
+        original_block.splitlines(),
+        fixed_block.splitlines(),
         fromfile=f"{state_name} (original)",
         tofile=f"{state_name} (fixed)",
         lineterm="",
     )
-    for line in diff:
-        print(line)
+    return "\n".join(diff_lines)
+
+
+def show_diff(original_block, fixed_block, state_name):
+    print(f"\n--- DIFF for state '{state_name}' ---")
+    print(build_diff_text(original_block, fixed_block, state_name))
     print("--- END DIFF ---\n")
+
+
+def _fix_description(provider):
+    if provider == "template":
+        return "Added timeout escape using == 15 counter pattern (deterministic template fallback)"
+    return f"LLM-generated timeout escape fix (via {provider})"
 
 
 def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
@@ -648,13 +663,20 @@ def apply_fix(filepath, state_name, fixed_block, output_filepath=None):
 
 def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
     """Generate, show, and apply a fix for every detected deadlock, then
-    re-run the full analysis on the fixed file to verify it worked."""
+    re-run the full analysis on the fixed file to verify it worked.
+
+    Returns (output_filepath, fixed_deadlocks, fixes_applied), where
+    fixes_applied is a list of {"state", "diff", "fix_description"}
+    dicts — one per deadlock a fix was successfully applied for — or
+    None if there were no deadlocks to fix.
+    """
     if not deadlocks:
         print("[INFO] No deadlocks to fix.")
         return None
 
     output_filepath = filepath.replace(".v", "_fixed.v")
     current_read_path = filepath
+    fixes_applied = []
 
     for state_name, condition in deadlocks:
         print(f"\n[FIX ENGINE] Generating fix for '{state_name}'...")
@@ -662,7 +684,7 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
         with open(current_read_path, "r") as f:
             fsm_source = f.read()
 
-        fixed_block = generate_fix(state_name, condition, fsm_source)
+        fixed_block, provider = generate_fix(state_name, condition, fsm_source)
 
         module_body = extract_module_body(fsm_source, TARGET_MODULE)
         cur_states = extract_states(module_body) if module_body else {}
@@ -672,7 +694,10 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
         else:
             original_block = "<could not locate original block>"
 
-        show_diff(original_block, fixed_block, state_name)
+        diff_text = build_diff_text(original_block, fixed_block, state_name)
+        print(f"\n--- DIFF for state '{state_name}' ---")
+        print(diff_text)
+        print("--- END DIFF ---\n")
 
         result_path = apply_fix(
             current_read_path, state_name, fixed_block, output_filepath=output_filepath
@@ -682,6 +707,13 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
             continue
 
         current_read_path = result_path
+        fixes_applied.append(
+            {
+                "state": state_name,
+                "diff": diff_text,
+                "fix_description": _fix_description(provider),
+            }
+        )
 
     print("\n[VERIFY] Re-running analysis on fixed file...")
     print("=" * 50)
@@ -690,7 +722,7 @@ def fix_and_verify(filepath, deadlocks, graph, states, reset_state):
         print(f"[ERROR] Could not parse fixed file {output_filepath}")
         return None
     fixed_deadlocks = analyze_and_report(output_filepath, fixed_states, fixed_reset, fixed_graph)
-    return output_filepath, fixed_deadlocks
+    return output_filepath, fixed_deadlocks, fixes_applied
 
 
 def main():
