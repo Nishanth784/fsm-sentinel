@@ -60,9 +60,17 @@ def extract_case_block(module_body):
 
 
 def split_state_blocks(case_block, state_names):
-    """Split the case(state) body into per-state text chunks."""
+    """Split the case(state) body into per-state text chunks.
+
+    Case labels may group multiple states together (a common Verilog
+    idiom for states that share identical behavior), e.g.:
+        no_ack_wdata, no_ack_waddr: begin ... end
+    Each name in such a group is treated as its own label sharing the
+    same block text.
+    """
+    names_alt = "|".join(re.escape(s) for s in state_names)
     label_pattern = re.compile(
-        r"(" + "|".join(re.escape(s) for s in state_names) + r")\s*:"
+        r"((?:(?:" + names_alt + r")\s*,\s*)*(?:" + names_alt + r"))\s*:"
     )
     labels = list(label_pattern.finditer(case_block))
 
@@ -71,29 +79,48 @@ def split_state_blocks(case_block, state_names):
 
     blocks = {}
     for i, lm in enumerate(labels):
-        name = lm.group(1)
+        names = [n.strip() for n in lm.group(1).split(",")]
         start = lm.end()
         end = labels[i + 1].start() if i + 1 < len(labels) else case_end
         end = min(end, case_end)
-        blocks[name] = case_block[start:end]
+        block_text = case_block[start:end]
+        for name in names:
+            blocks[name] = block_text
     return blocks
 
 
-# Matches, in order of precedence: "else if (COND)", "if (COND)", "else"
-CONDITION_TOKEN = re.compile(
-    r"else\s+if\s*\(([^)]*)\)|if\s*\(([^)]*)\)|(else)\b"
-)
+# Matches the *keyword* only; the condition itself (when present) is
+# extracted separately via balanced-paren scanning, since conditions may
+# contain nested parentheses (e.g. "(a == 1) && (b == 1)") that a simple
+# "[^)]*" regex cannot capture correctly.
+KEYWORD_TOKEN = re.compile(r"else\s+if\b|\bif\b|\belse\b")
 
 ASSIGNMENT = re.compile(r"state\s*<=\s*(\w+)\s*;")
+
+
+def find_matching_paren(text, open_idx):
+    """Given text[open_idx] == '(', return the index of the matching ')'.
+
+    Returns None if the parentheses are unbalanced.
+    """
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
 
 
 def parse_transitions_for_state(state_name, block_text):
     """Return a list of (to_state, condition) tuples for one state block."""
     transitions = []
 
-    tokens = list(CONDITION_TOKEN.finditer(block_text))
+    keyword_matches = list(KEYWORD_TOKEN.finditer(block_text))
 
-    if not tokens:
+    if not keyword_matches:
         # No if/else at all in this block -- expect at most one
         # unconditional assignment.
         assigns = ASSIGNMENT.findall(block_text)
@@ -108,21 +135,51 @@ def parse_transitions_for_state(state_name, block_text):
             )
         return transitions
 
-    # Walk each condition token, and find the state<= assignment that
-    # belongs to it (the first assignment after the token and before the
-    # next token).
-    for i, tok in enumerate(tokens):
-        if tok.group(1) is not None:
-            condition = tok.group(1).strip()
-        elif tok.group(2) is not None:
-            condition = tok.group(2).strip()
-        else:
+    # For each keyword, determine its condition (balanced-paren scan for
+    # if/else if, or the literal "else" for a bare else) and the segment
+    # of text up to the next keyword, then find the state<= assignment
+    # that belongs to that segment.
+    segments = []
+    parse_ok = True
+    for i, kw in enumerate(keyword_matches):
+        keyword_text = kw.group(0)
+        is_bare_else = re.fullmatch(r"else", keyword_text.strip()) is not None
+
+        if is_bare_else:
             condition = "else"
+            segment_start = kw.end()
+        else:
+            paren_start = block_text.find("(", kw.end())
+            next_kw_start = (
+                keyword_matches[i + 1].start()
+                if i + 1 < len(keyword_matches)
+                else len(block_text)
+            )
+            if paren_start == -1 or paren_start > next_kw_start:
+                parse_ok = False
+                continue
+            paren_end = find_matching_paren(block_text, paren_start)
+            if paren_end is None:
+                parse_ok = False
+                continue
+            condition = block_text[paren_start + 1 : paren_end].strip()
+            segment_start = paren_end + 1
 
-        segment_start = tok.end()
-        segment_end = tokens[i + 1].start() if i + 1 < len(tokens) else len(block_text)
-        segment = block_text[segment_start:segment_end]
+        segment_end = (
+            keyword_matches[i + 1].start()
+            if i + 1 < len(keyword_matches)
+            else len(block_text)
+        )
+        segments.append((condition, block_text[segment_start:segment_end]))
 
+    if not parse_ok:
+        print(
+            f"[PARSER WARNING] Could not parse transition in state "
+            f"{state_name} — skipped"
+        )
+        return transitions
+
+    for condition, segment in segments:
         assigns = ASSIGNMENT.findall(segment)
         if len(assigns) == 1:
             transitions.append((assigns[0], condition))
