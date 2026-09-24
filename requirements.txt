@@ -21,6 +21,10 @@
 #                       falls back to a deterministic template fix if this
 #                       isn't installed or no ANTHROPIC_API_KEY is set, but
 #                       the import statement is in the code, so it's listed.
+# groq               — api.py (POST /chat, via the official `groq` SDK).
+#                       Optional at runtime: /chat falls back to a plain
+#                       deadlock summary if this isn't installed or no
+#                       GROQ_API_KEY is set. No version pin per spec.
 
 fastapi==0.141.1
 uvicorn==0.53.0
@@ -29,3 +33,4 @@ httpx==0.28.1
 reportlab==5.0.1
 requests==2.33.1
 anthropic==1.7.0
+groq

@@ -25,6 +25,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 BATCH_ZIP_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 
@@ -781,3 +782,105 @@ async def export_pdf(file: UploadFile = File(...)):
         return _error_response(exc.error, exc.detail)
     except Exception as exc:
         return _error_response("Internal error while generating PDF", str(exc), status_code=500)
+
+
+# =====================================================================
+# Chat (ask questions about an /analyze result)
+# =====================================================================
+
+
+class ChatRequest(BaseModel):
+    analysis: dict
+    message: str
+
+
+def _build_analysis_context(analysis: dict) -> str:
+    """Turn an /analyze response into a concise plain-English summary
+    for the chat system prompt — not raw JSON."""
+    lines = []
+    for result in analysis.get("results", []):
+        module_name = result.get("module_name", "unknown module")
+        states_found = result.get("states_found", "unknown")
+        reset_state = result.get("reset_state", "unknown")
+        confidence = result.get("parse_confidence", "unknown")
+        unreachable = result.get("reachability", {}).get("unreachable", [])
+        deadlocks = result.get("deadlocks", [])
+
+        lines.append(
+            f"Module '{module_name}': {states_found} states, reset state "
+            f"'{reset_state}', parse confidence {confidence}%."
+        )
+
+        if unreachable:
+            lines.append(f"  Unreachable states: {', '.join(unreachable)}.")
+        else:
+            lines.append("  All states reachable from reset.")
+
+        if deadlocks:
+            for d in deadlocks:
+                lines.append(
+                    f"  Deadlock in state '{d.get('state')}' "
+                    f"(severity {d.get('severity')}, bug pattern "
+                    f"{d.get('bug_pattern')}): blocking condition "
+                    f"`{d.get('condition')}`. {d.get('scenario')}"
+                )
+        else:
+            lines.append("  No deadlocks detected.")
+
+    return "\n".join(lines)
+
+
+def _fallback_deadlock_summary(analysis: dict) -> str:
+    """Plain-text deadlock listing read directly from the analysis
+    dict, used when the LLM call isn't available."""
+    parts = []
+    for result in analysis.get("results", []):
+        module_name = result.get("module_name", "unknown module")
+        for d in result.get("deadlocks", []):
+            parts.append(
+                f"{module_name}.{d.get('state')} "
+                f"({d.get('severity')} severity, {d.get('bug_pattern')})"
+            )
+    if not parts:
+        return "no deadlocks were found in this analysis."
+    return "; ".join(parts)
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    context = _build_analysis_context(request.analysis)
+    system_prompt = (
+        "You are FSM Sentinel, an expert hardware design analysis assistant. "
+        "You have just analyzed a Verilog file and found the following: "
+        f"{context}. Answer the user's questions about this analysis concisely "
+        "and technically accurately. If asked about things outside this "
+        "analysis, say you can only speak to the uploaded file."
+    )
+
+    try:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY not set")
+
+        from groq import Groq
+
+        client = Groq(api_key=api_key)
+        completion = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.message},
+            ],
+            max_tokens=400,
+            temperature=0.3,
+        )
+        reply = completion.choices[0].message.content
+        return {"reply": reply}
+    except Exception:
+        return {
+            "reply": (
+                "I can see the analysis results but the AI assistant is "
+                "temporarily unavailable. The key finding: "
+                f"{_fallback_deadlock_summary(request.analysis)}"
+            )
+        }
