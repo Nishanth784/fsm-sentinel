@@ -866,12 +866,12 @@ async def chat(request: ChatRequest):
 
         client = Groq(api_key=api_key)
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.message},
             ],
-            max_tokens=400,
+            max_tokens=1024,
             temperature=0.3,
         )
         reply = completion.choices[0].message.content
