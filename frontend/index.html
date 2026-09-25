@@ -1,0 +1,1268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FSM Sentinel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+:root {
+  --bg: #0D0D0D;
+  --panel: #141414;
+  --border: #2A2A2A;
+  --text: #E0E0E0;
+  --text2: #666666;
+  --green: #00FF41;
+  --red: #FF3333;
+  --orange: #FF8C00;
+  --grey: #444444;
+  --blue: #4488FF;
+}
+* { box-sizing: border-box; border-radius: 0 !important; box-shadow: none !important; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+button, input, select, textarea { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-variant-ligatures: none; }
+a { color: var(--green); }
+
+header {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  background: var(--bg); flex-shrink: 0;
+}
+header .brand { display: flex; flex-direction: column; }
+header .title { font-weight: 700; font-size: 16px; color: var(--text); line-height: 24px; }
+header .tagline { color: var(--text2); font-size: 12px; }
+header .status { margin-left: auto; color: var(--text2); font-size: 12px; line-height: 24px; }
+header .status .dot-ok { color: var(--green); }
+header .status .dot-bad { color: var(--red); }
+
+main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.page { display: none; flex: 1; flex-direction: column; min-height: 0; padding: 20px; }
+.page.active { display: flex; }
+
+.g { color: var(--green); }
+.r { color: var(--red); }
+.o { color: var(--orange); }
+.b { color: var(--blue); }
+.dim { color: var(--text2); }
+.mono-green { color: var(--green); }
+
+.btn {
+  background: transparent; color: var(--text2);
+  border: 1px solid var(--border); padding: 10px 18px; cursor: pointer;
+}
+.btn:hover { color: var(--text); border-color: var(--text2); }
+.btn.primary { background: var(--green); color: var(--bg); border-color: var(--green); font-weight: 700; }
+.btn.primary:hover { background: #33FF66; color: var(--bg); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+
+.rule { color: var(--border); white-space: pre; overflow: hidden; user-select: none; }
+.err { color: var(--red); white-space: pre-wrap; margin-top: 12px; }
+.err:empty { display: none; }
+
+/* ---------- Page 1 ---------- */
+#page-upload { align-items: center; justify-content: center; }
+.upload-wrap { width: 560px; max-width: 100%; display: flex; flex-direction: column; gap: 14px; }
+.dropzone {
+  background: var(--panel); border: 1px dashed var(--border);
+  padding: 44px 20px; text-align: center; cursor: pointer; user-select: none;
+}
+.dropzone:hover, .dropzone.drag { border-color: var(--green); }
+.dropzone.has-file { border: 1px solid var(--green); }
+.dropzone .dz-title { color: var(--text); margin-bottom: 10px; }
+.dropzone .dz-types { color: var(--text2); margin-bottom: 18px; letter-spacing: 2px; }
+.dropzone .dz-file { color: var(--green); margin-top: 14px; min-height: 1.5em; word-break: break-all; }
+.dropzone .dz-label { color: var(--text2); margin-bottom: 8px; }
+.compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.compare-grid .dropzone { padding: 28px 12px; }
+#analyze-btn, #compare-btn { width: 100%; }
+.hidden { display: none !important; }
+
+/* ---------- Page 2 ---------- */
+.split { display: flex; gap: 16px; flex: 1; min-height: 0; }
+.panel { background: var(--panel); border: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+.panel-head {
+  border-bottom: 1px solid var(--border); padding: 8px 12px;
+  display: flex; gap: 12px; align-items: center; flex-shrink: 0;
+}
+.panel-head .dim { font-size: 12px; }
+.panel-head select {
+  margin-left: auto; background: var(--bg); color: var(--green);
+  border: 1px solid var(--border); padding: 2px 6px;
+}
+.panel-body { padding: 12px 14px; overflow: auto; flex: 1; min-height: 0; }
+.left { width: 55%; }
+.right { width: 45%; }
+.term-line { white-space: pre-wrap; }
+.diagram { flex: 1; min-height: 360px; position: relative; overflow: hidden; }
+.diagram svg { width: 100%; height: 100%; display: block; cursor: grab; }
+.diagram .legend {
+  position: absolute; left: 10px; bottom: 8px; font-size: 11px; color: var(--text2);
+  background: var(--panel); border: 1px solid var(--border); padding: 4px 8px;
+}
+.legend span { margin-right: 10px; }
+.legend i { display: inline-block; width: 9px; height: 9px; margin-right: 4px; vertical-align: -1px; border: 1px solid; }
+.diagram .hint { position: absolute; right: 10px; bottom: 8px; font-size: 11px; color: var(--text2); }
+
+.node rect { fill: var(--panel); stroke-width: 1px; transition: stroke 800ms, fill 800ms, opacity 200ms; }
+.node text { font-family: 'JetBrains Mono', monospace; font-size: 11px; transition: fill 800ms, opacity 200ms; pointer-events: none; }
+.node { cursor: pointer; }
+.node.t-normal rect { stroke: var(--grey); }
+.node.t-normal text { fill: var(--text); }
+.node.t-reset rect { stroke: var(--blue); fill: #0F1626; }
+.node.t-reset text { fill: var(--blue); }
+.node.t-unreachable rect { stroke: var(--orange); stroke-dasharray: 3 2; fill: #1F1406; }
+.node.t-unreachable text { fill: var(--orange); }
+.node.t-deadlock rect { stroke: var(--red); fill: #260808; animation: pulse 1.5s ease-in-out infinite; }
+.node.t-deadlock text { fill: var(--red); }
+@keyframes pulse {
+  0%, 100% { filter: drop-shadow(0 0 0 rgba(255, 51, 51, 0)); stroke-width: 1px; }
+  50% { filter: drop-shadow(0 0 5px rgba(255, 51, 51, 0.85)); stroke-width: 2px; }
+}
+.node.resolved rect { stroke: var(--grey); fill: var(--panel); animation: none; }
+.node.resolved text { fill: var(--text); }
+.edge line, .edge path.vis { stroke: #3A3A3A; stroke-width: 1px; fill: none; transition: stroke 200ms, opacity 200ms; }
+.edge .hit { stroke: transparent; stroke-width: 10px; fill: none; cursor: help; }
+.edge text { font-size: 10px; fill: var(--text2); opacity: 0; pointer-events: none; transition: opacity 120ms; }
+.edge:hover line, .edge:hover path.vis { stroke: var(--text2); }
+.edge:hover text { opacity: 1; }
+.edge.to-deadlock line, .edge.to-deadlock path.vis { stroke: #5A2020; }
+svg.focus .node:not(.hl) rect, svg.focus .node:not(.hl) text { opacity: 0.15; }
+svg.focus .edge:not(.hl) { opacity: 0.08; }
+svg.focus .edge.hl line, svg.focus .edge.hl path.vis { stroke: var(--green); }
+svg.focus .edge.hl text { opacity: 1; fill: var(--green); }
+.edge-label-bg { fill: var(--bg); opacity: 0; }
+.edge:hover .edge-label-bg, svg.focus .edge.hl .edge-label-bg { opacity: 0.9; }
+
+.kv { display: grid; grid-template-columns: 11ch 1fr; column-gap: 8px; }
+.kv .k { color: var(--text2); }
+.kv .v { color: var(--green); word-break: break-word; }
+.sev-HIGH { color: var(--red); }
+.sev-MEDIUM { color: var(--orange); }
+.sev-LOW { color: #E0C040; }
+.scenario { color: var(--text); padding-left: 2ch; margin-top: 4px; }
+.section { margin-top: 14px; }
+.actions { margin-top: 14px; flex-shrink: 0; }
+
+.batch-row { border-bottom: 1px solid var(--border); }
+.batch-row .row-main {
+  display: grid; grid-template-columns: 2ch 1.6fr 0.8fr 1.1fr 0.9fr 7ch; gap: 8px;
+  padding: 6px 4px; cursor: pointer;
+}
+.batch-row .row-main:hover { background: #1B1B1B; }
+.batch-row .row-detail { padding: 6px 4px 10px 4ch; display: none; }
+.batch-row.open .row-detail { display: block; }
+
+/* ---------- Page 3 ---------- */
+.diff {
+  background: var(--panel); border: 1px solid var(--border);
+  overflow: auto; flex: 1; min-height: 0; font-size: 12.5px;
+}
+.diff table { border-collapse: collapse; width: 100%; }
+.diff td { padding: 0 10px; white-space: pre; vertical-align: top; }
+.diff td.ln { color: #444; text-align: right; user-select: none; width: 1%; border-right: 1px solid var(--border); }
+.diff tr.ctx td.code { color: var(--text2); background: var(--panel); }
+.diff tr.add td { background: #002A00; }
+.diff tr.add td.code { color: var(--green); }
+.diff tr.del td { background: #2A0000; }
+.diff tr.del td.code { color: #FF6666; }
+.diff tr.hunk td { color: var(--blue); background: #0F1626; }
+.diff-label { margin: 14px 0 6px; }
+.fix-desc { margin-top: 8px; }
+
+/* ---------- Page 4 / 5 ---------- */
+.verify-split { display: flex; gap: 16px; flex: 1; min-height: 0; }
+.verify-split .panel { flex: 1; }
+.summary-box { border: 1px solid var(--border); background: var(--panel); padding: 20px 24px; margin: 16px 0; max-width: 620px; }
+.summary-box .kv { grid-template-columns: 17ch 1fr; }
+.center-col { max-width: 720px; }
+.pass-banner { color: var(--green); font-weight: 700; margin-top: 10px; }
+.fail-banner { color: var(--red); font-weight: 700; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M12 2L4 6V12C4 16.4 7.4 20.5 12 22C16.6 20.5 20 16.4 20 12V6L12 2Z" stroke="#00FF41" stroke-width="1.5" fill="none"/>
+    <path d="M8 12H10M10 12V9M10 12H14M14 12V15M14 12H16" stroke="#00FF41" stroke-width="1" stroke-linecap="square"/>
+  </svg>
+  <div class="brand">
+    <div class="title">FSM Sentinel</div>
+    <div class="tagline">// catch hardware bugs before they reach silicon</div>
+  </div>
+  <div class="status" id="backend-status">backend: <span class="dim">checking...</span></div>
+</header>
+
+<main>
+
+<!-- ============ PAGE 1 — UPLOAD ============ -->
+<section class="page active" id="page-upload">
+  <div class="upload-wrap">
+    <div id="single-mode">
+      <div class="dropzone" id="dz-main" tabindex="0">
+        <div class="dz-title">Drop your Verilog file here</div>
+        <div class="dz-types">.v &nbsp;.sv &nbsp;.zip</div>
+        <button class="btn" type="button" data-browse="main">[ Browse Files ]</button>
+        <div class="dz-file" id="dz-main-file"></div>
+      </div>
+    </div>
+
+    <div id="compare-mode" class="hidden">
+      <div class="compare-grid">
+        <div class="dropzone" id="dz-v1" tabindex="0">
+          <div class="dz-title">Version 1</div>
+          <div class="dz-label">(original)</div>
+          <button class="btn" type="button" data-browse="v1">[ Browse ]</button>
+          <div class="dz-file" id="dz-v1-file"></div>
+        </div>
+        <div class="dropzone" id="dz-v2" tabindex="0">
+          <div class="dz-title">Version 2</div>
+          <div class="dz-label">(updated)</div>
+          <button class="btn" type="button" data-browse="v2">[ Browse ]</button>
+          <div class="dz-file" id="dz-v2-file"></div>
+        </div>
+      </div>
+    </div>
+
+    <input type="file" id="file-main" accept=".v,.sv,.zip" class="hidden">
+    <input type="file" id="file-v1" accept=".v,.sv" class="hidden">
+    <input type="file" id="file-v2" accept=".v,.sv" class="hidden">
+
+    <button class="btn primary" id="analyze-btn" type="button">[ Analyze ]</button>
+    <button class="btn primary hidden" id="compare-btn" type="button">[ Compare ]</button>
+    <div class="btn-row">
+      <button class="btn" id="toggle-compare" type="button">[ Compare Versions ]</button>
+    </div>
+    <div class="err" id="upload-err"></div>
+  </div>
+</section>
+
+<!-- ============ PAGE 2 — ANALYSIS ============ -->
+<section class="page" id="page-analysis">
+  <div class="split">
+    <div class="panel left" id="left-panel">
+      <div class="panel-head">
+        <span id="diagram-title">FSM: <span class="g" id="diagram-module">—</span></span>
+        <span class="dim" id="diagram-sub">// left-to-right flowchart</span>
+        <select id="module-select" class="hidden" title="module"></select>
+      </div>
+      <div class="diagram" id="diagram-main">
+        <svg></svg>
+        <div class="legend">
+          <span><i style="border-color:#FF3333;background:#260808"></i>deadlock</span>
+          <span><i style="border-color:#4488FF;background:#0F1626"></i>reset</span>
+          <span><i style="border-color:#FF8C00;background:#1F1406"></i>unreachable</span>
+          <span><i style="border-color:#444444"></i>normal</span>
+        </div>
+        <div class="hint">click node: focus &middot; scroll: zoom &middot; drag: pan</div>
+      </div>
+      <div class="panel-body hidden" id="batch-list"></div>
+      <div class="panel-body hidden" id="compare-view"></div>
+    </div>
+    <div class="panel right">
+      <div class="panel-head"><span class="dim">// report</span></div>
+      <div class="panel-body" id="report"></div>
+    </div>
+  </div>
+  <div class="actions btn-row">
+    <button class="btn" id="export-pdf-btn" type="button">[ Export PDF ]</button>
+    <button class="btn" data-back type="button">[ &larr; Back ]</button>
+    <span class="err" id="analysis-err" style="margin:0"></span>
+  </div>
+</section>
+
+<!-- ============ PAGE 3 — FIX ============ -->
+<section class="page" id="page-fix">
+  <div id="fix-log"></div>
+  <div class="diff-label hidden" id="diff-label"></div>
+  <div class="diff hidden" id="diff"></div>
+  <div class="fix-desc dim hidden" id="fix-desc"></div>
+  <div class="err" id="fix-err"></div>
+  <div class="actions">
+    <div class="rule">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+    <div class="btn-row" style="margin:8px 0">
+      <button class="btn primary" id="apply-fix-btn" type="button" disabled>[ Apply Fix &amp; Download ]</button>
+      <button class="btn" data-back type="button">[ &larr; Back ]</button>
+    </div>
+    <div class="rule">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+  </div>
+</section>
+
+<!-- ============ PAGE 4 — VERIFY ============ -->
+<section class="page" id="page-verify">
+  <div class="verify-split">
+    <div class="panel" style="flex:0 0 42%">
+      <div class="panel-head"><span class="dim">// verification</span></div>
+      <div class="panel-body" id="verify-log"></div>
+    </div>
+    <div class="panel" style="flex:1">
+      <div class="panel-head">
+        <span>FSM: <span class="g" id="verify-module">—</span></span>
+        <span class="dim">// post-fix state diagram</span>
+      </div>
+      <div class="diagram" id="diagram-verify"><svg></svg>
+        <div class="hint">click node: focus &middot; scroll: zoom &middot; drag: pan</div>
+      </div>
+    </div>
+  </div>
+  <div class="err" id="verify-err"></div>
+  <div class="actions hidden" id="verify-actions">
+    <div class="rule">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+    <div class="btn-row" style="margin:8px 0">
+      <button class="btn primary" id="download-btn" type="button">[ Download Fixed File ]</button>
+      <button class="btn" data-reset type="button">[ Analyze Another File ]</button>
+      <button class="btn" data-back type="button">[ &larr; Back ]</button>
+    </div>
+    <div class="rule">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+  </div>
+</section>
+
+<!-- ============ PAGE 5 — DONE ============ -->
+<section class="page" id="page-done">
+  <div class="center-col">
+    <div id="done-log"></div>
+    <div class="summary-box" id="done-summary"></div>
+    <div class="btn-row">
+      <button class="btn primary" data-reset type="button">[ Analyze Another File ]</button>
+      <button class="btn" id="done-pdf-btn" type="button">[ Export PDF Report ]</button>
+      <button class="btn" data-back type="button">[ &larr; Back ]</button>
+    </div>
+    <div class="err" id="done-err"></div>
+  </div>
+</section>
+
+</main>
+
+<script>
+(function () {
+'use strict';
+
+const API = (new URLSearchParams(location.search).get('api') || 'http://localhost:8000').replace(/\/$/, '');
+const BACKEND_DOWN = '[ERROR] backend not running. start: uvicorn api:app --port 8000';
+const ACCEPTED = ['.v', '.sv', '.zip'];
+
+// ------------------------------------------------------------------ state
+const S = {
+  file: null, fileV1: null, fileV2: null,
+  mode: 'single',            // single | batch | compare
+  compareOpen: false,
+  analysis: null, viz: null, fix: null,
+  moduleName: null,          // module currently focused
+  fixModule: null,           // module whose deadlock is being fixed
+  fixedContent: null, fixedViz: null, fixedFilename: null,
+  history: [], current: 'page-upload',
+  runId: 0,
+};
+
+// ------------------------------------------------------------------ utils
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function ext(name) { const m = /\.[^.]+$/.exec(name || ''); return m ? m[0].toLowerCase() : ''; }
+function stem(name) { return (name || 'design.v').replace(/\.[^.]+$/, ''); }
+function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
+function pad(s, n) { s = String(s); return s.length >= n ? s + ' ' : s + ' '.repeat(n - s.length); }
+function tag(kind) {
+  const cls = { PASS: 'g', WARN: 'o', ERROR: 'r' }[kind] || 'dim';
+  return '<span class="' + cls + '">[' + kind + ']</span>';
+}
+function setErr(id, msg) { const el = $(id); if (el) el.textContent = msg || ''; }
+
+class ApiError extends Error {}
+
+async function api(path, form, as) {
+  let res;
+  try {
+    res = await fetch(API + path, { method: 'POST', body: form });
+  } catch (e) {
+    markBackend(false);
+    throw new ApiError(BACKEND_DOWN);
+  }
+  markBackend(true);
+  if (!res.ok) {
+    let msg = 'HTTP ' + res.status;
+    try {
+      const j = await res.json();
+      if (j && (j.error || j.detail)) {
+        const detail = typeof j.detail === 'string' ? j.detail : (j.detail ? JSON.stringify(j.detail) : '');
+        msg = (j.error || '') + (j.error && detail ? ': ' : '') + detail;
+      }
+    } catch (_) { /* non-JSON error body */ }
+    throw new ApiError('[ERROR] ' + msg);
+  }
+  if (as === 'blob') return { blob: await res.blob(), headers: res.headers };
+  try { return await res.json(); }
+  catch (e) { throw new ApiError('[ERROR] backend returned invalid JSON'); }
+}
+function formFor(file, name) {
+  const fd = new FormData();
+  fd.append(name || 'file', file, file.name);
+  return fd;
+}
+function errText(e) {
+  if (e instanceof ApiError) return e.message;
+  return '[ERROR] ' + (e && e.message ? e.message : String(e));
+}
+function markBackend(ok) {
+  $('backend-status').innerHTML = 'backend: ' + (ok
+    ? '<span class="dot-ok">[ONLINE]</span> <span class="dim">' + esc(API) + '</span>'
+    : '<span class="dot-bad">[OFFLINE]</span>');
+}
+async function pingBackend() {
+  try { await fetch(API + '/openapi.json', { method: 'GET' }); markBackend(true); }
+  catch (e) { markBackend(false); }
+}
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function filenameFromHeaders(headers, fallback) {
+  const cd = headers.get('content-disposition') || '';
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+  return m ? decodeURIComponent(m[1]) : fallback;
+}
+
+// typewriter: appends lines to container one at a time; aborted if navigation happens
+async function typeLines(container, lines, delay, runId) {
+  for (const line of lines) {
+    if (runId !== S.runId) return false;
+    const div = document.createElement('div');
+    div.className = 'term-line';
+    div.innerHTML = line;
+    container.appendChild(div);
+    await sleep(delay);
+  }
+  return runId === S.runId;
+}
+
+// ------------------------------------------------------------------ navigation
+function show(pageId, push) {
+  if (push !== false && S.current !== pageId) S.history.push(S.current);
+  document.querySelectorAll('.page').forEach((p) => p.classList.toggle('active', p.id === pageId));
+  S.current = pageId;
+  S.runId++;
+  window.scrollTo(0, 0);
+}
+function back() {
+  const prev = S.history.pop();
+  if (!prev) return;
+  show(prev, false);
+  if (prev === 'page-analysis') renderAnalysis(false);
+  if (prev === 'page-fix') renderFixView(false);
+  if (prev === 'page-verify') renderVerify(false);
+}
+function resetAll() {
+  Object.assign(S, {
+    file: null, fileV1: null, fileV2: null, mode: 'single',
+    analysis: null, viz: null, fix: null, moduleName: null, fixModule: null,
+    fixedContent: null, fixedViz: null, fixedFilename: null, history: [],
+  });
+  ['file-main', 'file-v1', 'file-v2'].forEach((id) => { $(id).value = ''; });
+  ['dz-main', 'dz-v1', 'dz-v2'].forEach((id) => { $(id).classList.remove('has-file'); $(id + '-file').textContent = ''; });
+  setCompareOpen(false);
+  ['upload-err', 'analysis-err', 'fix-err', 'verify-err', 'done-err'].forEach((id) => setErr(id, ''));
+  show('page-upload', false);
+}
+document.querySelectorAll('[data-back]').forEach((b) => b.addEventListener('click', back));
+document.querySelectorAll('[data-reset]').forEach((b) => b.addEventListener('click', resetAll));
+
+// ------------------------------------------------------------------ page 1: upload
+function setFile(slot, file) {
+  setErr('upload-err', '');
+  if (!file) return;
+  const allowed = slot === 'main' ? ACCEPTED : ['.v', '.sv'];
+  if (!allowed.includes(ext(file.name))) {
+    setErr('upload-err', '[ERROR] unsupported file type. accepted: ' + allowed.join(' '));
+    return;
+  }
+  if (slot === 'main') S.file = file;
+  if (slot === 'v1') S.fileV1 = file;
+  if (slot === 'v2') S.fileV2 = file;
+  $('dz-' + slot).classList.add('has-file');
+  $('dz-' + slot + '-file').textContent = '> ' + file.name + '  (' + (file.size / 1024).toFixed(1) + ' KB)';
+}
+['main', 'v1', 'v2'].forEach((slot) => {
+  const dz = $('dz-' + slot), input = $('file-' + slot);
+  dz.addEventListener('click', () => input.click());
+  dz.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
+  input.addEventListener('change', () => setFile(slot, input.files[0]));
+  dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('drag'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+  dz.addEventListener('drop', (e) => {
+    e.preventDefault(); dz.classList.remove('drag');
+    if (e.dataTransfer && e.dataTransfer.files.length) setFile(slot, e.dataTransfer.files[0]);
+  });
+});
+document.querySelectorAll('[data-browse]').forEach((b) => b.addEventListener('click', (e) => {
+  e.stopPropagation();
+  $('file-' + b.dataset.browse).click();
+}));
+function setCompareOpen(open) {
+  S.compareOpen = open;
+  $('single-mode').classList.toggle('hidden', open);
+  $('compare-mode').classList.toggle('hidden', !open);
+  $('analyze-btn').classList.toggle('hidden', open);
+  $('compare-btn').classList.toggle('hidden', !open);
+  $('toggle-compare').textContent = open ? '[ Single File ]' : '[ Compare Versions ]';
+  setErr('upload-err', '');
+}
+$('toggle-compare').addEventListener('click', () => setCompareOpen(!S.compareOpen));
+
+$('analyze-btn').addEventListener('click', async () => {
+  setErr('upload-err', '');
+  if (!S.file) { setErr('upload-err', '[ERROR] no file selected. drop a .v .sv or .zip file'); return; }
+  const btn = $('analyze-btn');
+  btn.disabled = true; btn.textContent = '[ANALYZING...]';
+  try {
+    if (ext(S.file.name) === '.zip') {
+      S.mode = 'batch';
+      S.analysis = await api('/analyze/batch', formFor(S.file));
+      S.viz = null;
+    } else {
+      S.mode = 'single';
+      const [analysis, viz] = await Promise.all([
+        api('/analyze', formFor(S.file)),
+        api('/visualize', formFor(S.file)),
+      ]);
+      S.analysis = analysis; S.viz = viz;
+      const results = analysis.results || [];
+      if (!results.length) throw new ApiError('[ERROR] no FSM found in ' + S.file.name);
+      const withDeadlock = results.find((r) => (r.deadlocks || []).length);
+      S.moduleName = (withDeadlock || results[0]).module_name;
+    }
+    S.fix = null; S.fixedContent = null; S.fixedViz = null;
+    show('page-analysis');
+    renderAnalysis(true);
+  } catch (e) {
+    setErr('upload-err', errText(e));
+  } finally {
+    btn.disabled = false; btn.textContent = '[ Analyze ]';
+  }
+});
+
+$('compare-btn').addEventListener('click', async () => {
+  setErr('upload-err', '');
+  if (!S.fileV1 || !S.fileV2) { setErr('upload-err', '[ERROR] select both version 1 and version 2'); return; }
+  const btn = $('compare-btn');
+  btn.disabled = true; btn.textContent = '[ANALYZING...]';
+  try {
+    const fd = new FormData();
+    fd.append('file_v1', S.fileV1, S.fileV1.name);
+    fd.append('file_v2', S.fileV2, S.fileV2.name);
+    S.mode = 'compare';
+    S.analysis = await api('/compare', fd);
+    show('page-analysis');
+    renderAnalysis(true);
+  } catch (e) {
+    setErr('upload-err', errText(e));
+  } finally {
+    btn.disabled = false; btn.textContent = '[ Compare ]';
+  }
+});
+
+// ------------------------------------------------------------------ diagram
+const NODE_W = 124, NODE_H = 28, COL_GAP = 34, ROW_GAP = 30, MARGIN = 24;
+
+// Layered left-to-right layout (Sugiyama-style): BFS ranks from reset,
+// barycenter ordering sweeps within each rank, straight edges.
+function layoutGraph(nodes, edges, resetId) {
+  const ids = nodes.map((n) => n.id);
+  const out = new Map(ids.map((id) => [id, []]));
+  const inc = new Map(ids.map((id) => [id, []]));
+  edges.forEach((e) => {
+    if (e.source === e.target || !out.has(e.source) || !out.has(e.target)) return;
+    out.get(e.source).push(e.target);
+    inc.get(e.target).push(e.source);
+  });
+  const rank = new Map();
+  const start = out.has(resetId) ? resetId : ids[0];
+  if (start !== undefined) {
+    rank.set(start, 0);
+    const q = [start];
+    while (q.length) {
+      const u = q.shift();
+      out.get(u).forEach((v) => { if (!rank.has(v)) { rank.set(v, rank.get(u) + 1); q.push(v); } });
+    }
+  }
+  // Unreached nodes: place after predecessors if any are ranked, else in a trailing column.
+  let maxRank = Math.max(0, ...rank.values());
+  let changed = true;
+  while (changed) {
+    changed = false;
+    ids.forEach((id) => {
+      if (rank.has(id)) return;
+      const preds = inc.get(id).filter((p) => rank.has(p));
+      if (preds.length) { rank.set(id, Math.max(...preds.map((p) => rank.get(p))) + 1); changed = true; }
+    });
+  }
+  maxRank = Math.max(0, ...rank.values());
+  ids.forEach((id) => { if (!rank.has(id)) rank.set(id, maxRank + 1); });
+
+  const layers = [];
+  ids.forEach((id) => { const r = rank.get(id); (layers[r] = layers[r] || []).push(id); });
+  for (let i = 0; i < layers.length; i++) layers[i] = layers[i] || [];
+
+  const posIndex = new Map();
+  const reindex = () => layers.forEach((L) => L.forEach((id, i) => posIndex.set(id, i)));
+  reindex();
+  const bary = (id, neigh) => {
+    const ns = neigh.get(id).filter((n) => posIndex.has(n));
+    if (!ns.length) return posIndex.get(id);
+    return ns.reduce((a, n) => a + posIndex.get(n), 0) / ns.length;
+  };
+  for (let sweep = 0; sweep < 6; sweep++) {
+    const down = sweep % 2 === 0;
+    const order = down ? layers.map((_, i) => i).slice(1) : layers.map((_, i) => i).reverse().slice(1);
+    order.forEach((li) => {
+      const neigh = down ? inc : out;
+      const L = layers[li];
+      const b = new Map(L.map((id) => [id, bary(id, neigh)]));
+      L.sort((a, c) => b.get(a) - b.get(c));
+      reindex();
+    });
+  }
+
+  const maxRows = Math.max(...layers.map((L) => L.length), 1);
+  const totalH = maxRows * NODE_H + (maxRows - 1) * ROW_GAP;
+  const pos = new Map();
+  layers.forEach((L, li) => {
+    const h = L.length * NODE_H + (L.length - 1) * ROW_GAP;
+    const y0 = MARGIN + (totalH - h) / 2;
+    L.forEach((id, i) => {
+      pos.set(id, { x: MARGIN + li * (NODE_W + COL_GAP), y: y0 + i * (NODE_H + ROW_GAP) });
+    });
+  });
+  return {
+    pos,
+    width: MARGIN * 2 + layers.length * NODE_W + (layers.length - 1) * COL_GAP,
+    height: MARGIN * 2 + totalH,
+  };
+}
+
+// Clip a segment from center a to center b at the border of b's rectangle.
+function borderPoint(cx, cy, tx, ty) {
+  const dx = tx - cx, dy = ty - cy;
+  if (dx === 0 && dy === 0) return { x: cx, y: cy };
+  const sx = (NODE_W / 2) / Math.abs(dx || 1e-9);
+  const sy = (NODE_H / 2) / Math.abs(dy || 1e-9);
+  const s = Math.min(sx, sy);
+  return { x: cx + dx * s, y: cy + dy * s };
+}
+
+function renderDiagram(container, mod, opts) {
+  opts = opts || {};
+  const svg = d3.select(container).select('svg');
+  svg.selectAll('*').remove();
+  svg.classed('focus', false);
+  if (!mod || !mod.nodes || !mod.nodes.length) {
+    svg.append('text').attr('x', 20).attr('y', 30).attr('fill', '#666').text('// no states to draw');
+    return null;
+  }
+  const resetId = (mod.metadata && mod.metadata.reset_state) || (mod.nodes.find((n) => n.type === 'reset') || {}).id;
+  const L = layoutGraph(mod.nodes, mod.edges || [], resetId);
+
+  // merge parallel edges (same source/target) into one with joined conditions
+  const merged = new Map();
+  (mod.edges || []).forEach((e) => {
+    if (!L.pos.has(e.source) || !L.pos.has(e.target)) return;
+    const k = e.source + '\u0000' + e.target;
+    if (!merged.has(k)) merged.set(k, { source: e.source, target: e.target, conditions: [] });
+    const c = merged.get(k).conditions;
+    if (!c.includes(e.condition)) c.push(e.condition);
+  });
+  const edges = Array.from(merged.values());
+  const typeOf = new Map(mod.nodes.map((n) => [n.id, n.type]));
+
+  const defs = svg.append('defs');
+  [['arrow', '#3A3A3A'], ['arrow-hl', '#00FF41'], ['arrow-red', '#5A2020']].forEach(([id, color]) => {
+    defs.append('marker').attr('id', container.id + '-' + id)
+      .attr('viewBox', '0 0 10 10').attr('refX', 9).attr('refY', 5)
+      .attr('markerWidth', 7).attr('markerHeight', 7).attr('orient', 'auto-start-reverse')
+      .append('path').attr('d', 'M0,0 L10,5 L0,10 z').attr('fill', color);
+  });
+  const mk = (id) => 'url(#' + container.id + '-' + id + ')';
+
+  const root = svg.append('g');
+  const gEdges = root.append('g');
+  const gNodes = root.append('g');
+
+  const eSel = gEdges.selectAll('g.edge').data(edges).enter().append('g')
+    .attr('class', (d) => 'edge' + (typeOf.get(d.target) === 'deadlock' ? ' to-deadlock' : ''));
+
+  eSel.each(function (d) {
+    const g = d3.select(this);
+    const a = L.pos.get(d.source), b = L.pos.get(d.target);
+    const label = d.conditions.join(' | ');
+    let lx, ly, pathD;
+    if (d.source === d.target) {
+      const x = a.x + NODE_W - 22, y = a.y;
+      pathD = 'M' + x + ',' + y + ' C' + (x) + ',' + (y - 26) + ' ' + (x + 26) + ',' + (y - 26) + ' ' + (x + 22) + ',' + (y);
+      lx = x + 11; ly = y - 24;
+    } else {
+      const ac = { x: a.x + NODE_W / 2, y: a.y + NODE_H / 2 };
+      const bc = { x: b.x + NODE_W / 2, y: b.y + NODE_H / 2 };
+      const p1 = borderPoint(ac.x, ac.y, bc.x, bc.y);
+      const p2 = borderPoint(bc.x, bc.y, ac.x, ac.y);
+      pathD = 'M' + p1.x + ',' + p1.y + ' L' + p2.x + ',' + p2.y;
+      lx = (p1.x + p2.x) / 2; ly = (p1.y + p2.y) / 2 - 4;
+    }
+    const isRed = typeOf.get(d.target) === 'deadlock';
+    g.append('path').attr('class', 'vis').attr('d', pathD).attr('marker-end', mk(isRed ? 'arrow-red' : 'arrow'));
+    g.append('path').attr('class', 'hit').attr('d', pathD);
+    const t = g.append('text').attr('x', lx).attr('y', ly).attr('text-anchor', 'middle').text(label.length > 60 ? label.slice(0, 57) + '...' : label);
+    g.append('title').text(d.source + ' → ' + d.target + '\n' + d.conditions.join('\n'));
+    // background behind label for readability
+    requestAnimationFrame(() => {
+      try {
+        const bb = t.node().getBBox();
+        g.insert('rect', 'text').attr('class', 'edge-label-bg')
+          .attr('x', bb.x - 3).attr('y', bb.y - 1).attr('width', bb.width + 6).attr('height', bb.height + 2);
+      } catch (_) { /* not rendered (hidden container) */ }
+    });
+  });
+
+  const nSel = gNodes.selectAll('g.node').data(mod.nodes, (d) => d.id).enter().append('g')
+    .attr('class', (d) => 'node t-' + (d.type || 'normal'))
+    .attr('data-id', (d) => d.id)
+    .attr('transform', (d) => { const p = L.pos.get(d.id); return 'translate(' + p.x + ',' + p.y + ')'; });
+  nSel.append('rect').attr('width', NODE_W).attr('height', NODE_H);
+  nSel.append('text').attr('x', NODE_W / 2).attr('y', NODE_H / 2 + 4).attr('text-anchor', 'middle')
+    .text((d) => d.label.length > 17 ? d.label.slice(0, 16) + '…' : d.label);
+  nSel.append('title').text((d) => d.label + '  [' + d.type + ']' + (d.severity ? '  severity: ' + d.severity : '') + (d.bug_pattern ? '\npattern: ' + d.bug_pattern : ''));
+
+  let focused = null;
+  const clearFocus = () => {
+    focused = null;
+    svg.classed('focus', false);
+    nSel.classed('hl', false); eSel.classed('hl', false);
+    eSel.select('path.vis').attr('marker-end', (d) => mk(typeOf.get(d.target) === 'deadlock' ? 'arrow-red' : 'arrow'));
+  };
+  nSel.on('click', function (ev, d) {
+    ev.stopPropagation();
+    if (focused === d.id) { clearFocus(); return; }
+    focused = d.id;
+    const connected = new Set([d.id]);
+    eSel.classed('hl', (e) => {
+      const hit = e.source === d.id || e.target === d.id;
+      if (hit) { connected.add(e.source); connected.add(e.target); }
+      return hit;
+    });
+    nSel.classed('hl', (n) => connected.has(n.id));
+    eSel.select('path.vis').attr('marker-end', (e) => (e.source === d.id || e.target === d.id) ? mk('arrow-hl') : mk('arrow'));
+    svg.classed('focus', true);
+  });
+  svg.on('click', clearFocus);
+
+  const zoom = d3.zoom().scaleExtent([0.2, 3]).on('zoom', (ev) => root.attr('transform', ev.transform));
+  svg.call(zoom).on('dblclick.zoom', null);
+  const fit = () => {
+    const w = container.clientWidth || 800, h = container.clientHeight || 400;
+    const k = Math.min(w / L.width, (h - 30) / L.height, 1.4);
+    const tx = (w - L.width * k) / 2, ty = Math.max(0, (h - 30 - L.height * k) / 2);
+    svg.call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
+  };
+  requestAnimationFrame(fit);
+  return { svg, nodes: nSel, fit };
+}
+
+function vizFor(viz, name) {
+  if (!viz || !viz.modules) return null;
+  return viz.modules.find((m) => m.module_name === name) || null;
+}
+function resultFor(name) {
+  return ((S.analysis && S.analysis.results) || []).find((r) => r.module_name === name) || null;
+}
+
+// ------------------------------------------------------------------ page 2: analysis
+let diagramHandle = null;
+const RULE = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
+
+function setLeftMode(which) {
+  $('diagram-main').classList.toggle('hidden', which !== 'diagram');
+  $('batch-list').classList.toggle('hidden', which !== 'batch');
+  $('compare-view').classList.toggle('hidden', which !== 'compare');
+}
+
+function renderAnalysis(animate) {
+  setErr('analysis-err', '');
+  $('export-pdf-btn').classList.toggle('hidden', S.mode !== 'single');
+  if (S.mode === 'batch') return renderBatch(animate);
+  if (S.mode === 'compare') return renderCompare(animate);
+  renderSingle(animate);
+}
+
+function renderSingle(animate) {
+  setLeftMode('diagram');
+  const results = S.analysis.results || [];
+  const sel = $('module-select');
+  sel.innerHTML = results.map((r) => '<option value="' + esc(r.module_name) + '">' + esc(r.module_name) +
+    ((r.deadlocks || []).length ? '  [deadlock]' : '') + '</option>').join('');
+  sel.value = S.moduleName;
+  sel.classList.toggle('hidden', results.length < 2);
+  $('diagram-module').textContent = S.moduleName;
+  $('diagram-sub').textContent = '// left-to-right flowchart';
+  diagramHandle = renderDiagram($('diagram-main'), vizFor(S.viz, S.moduleName));
+  renderReport(animate);
+}
+$('module-select').addEventListener('change', (e) => {
+  S.moduleName = e.target.value;
+  renderSingle(true);
+});
+
+async function renderReport(animate) {
+  const runId = S.runId;
+  const r = resultFor(S.moduleName);
+  const report = $('report');
+  report.innerHTML = '';
+  if (!r) return;
+  const status = document.createElement('div');
+  report.appendChild(status);
+  const multi = (S.analysis.results || []).length > 1;
+  const lines = [
+    '<span class="dim">&gt;</span> analyzing <span class="g">' + esc(S.analysis.filename || S.file.name) + '</span>...',
+    multi ? '<span class="dim">&gt;</span> fsm modules found: <span class="g">' + S.analysis.results.length + '</span> <span class="dim">// showing ' + esc(r.module_name) + '</span>' : null,
+    '<span class="dim">&gt;</span> parse confidence: <span class="g">' + esc(r.parse_confidence) + '%</span>',
+    '<span class="dim">&gt;</span> states found: <span class="g">' + esc(r.states_found) + '</span>',
+    '<span class="dim">&gt;</span> reset state: <span class="g">' + esc(r.reset_state) + '</span>',
+    '<span class="dim">&gt;</span> warnings: <span class="' + (r.summary.total_warnings ? 'o' : 'g') + '">' + esc(r.summary.total_warnings) + '</span>',
+  ].filter(Boolean);
+  if (animate) {
+    const ok = await typeLines(status, lines, 100, runId);
+    if (!ok) return;
+  } else {
+    status.innerHTML = lines.map((l) => '<div class="term-line">' + l + '</div>').join('');
+  }
+
+  const body = document.createElement('div');
+  body.className = 'section';
+  let html = '';
+  (r.deadlocks || []).forEach((d, i) => {
+    html += '<div class="rule">' + RULE + '</div>' +
+      '<div>' + tag('WARN') + ' deadlock detected</div>' +
+      '<div class="rule">' + RULE + '</div>' +
+      '<div class="kv">' +
+        '<span class="k">state:</span><span class="v">' + esc(d.state) + '</span>' +
+        '<span class="k">severity:</span><span class="sev-' + esc(d.severity) + '">' + esc(d.severity) + '</span>' +
+        '<span class="k">pattern:</span><span class="v">' + esc(d.bug_pattern) + '</span>' +
+        '<span class="k">condition:</span><span class="v">' + esc(d.condition) + '</span>' +
+      '</div>' +
+      '<div class="section dim">scenario:</div>' +
+      '<div class="scenario">' + esc(d.scenario) + '</div>' +
+      (d.pattern_description ? '<div class="section dim">pattern note:</div><div class="scenario dim">' + esc(d.pattern_description) + '</div>' : '') +
+      '<div class="rule" style="margin-top:10px">' + RULE + '</div>' +
+      '<button class="btn primary fix-btn" data-state="' + esc(d.state) + '" type="button" style="margin:6px 0">[ Fix This ]</button>' +
+      '<div class="rule">' + RULE + '</div>';
+  });
+  if (!(r.deadlocks || []).length) {
+    html += '<div>' + tag('PASS') + ' no deadlocks detected</div>';
+  }
+  const un = (r.reachability && r.reachability.unreachable) || [];
+  html += '<div class="section">';
+  if (!un.length) {
+    html += tag('PASS') + ' all ' + esc(r.states_found) + ' states reachable from reset';
+  } else {
+    un.forEach((s) => {
+      html += '<div>' + tag('WARN') + ' unreachable: <span class="g">' + esc(s) + '</span></div>' +
+        '<div class="dim" style="padding-left:7ch">no path from ' + esc(r.reset_state) + ' to ' + esc(s) + ' exists</div>';
+    });
+  }
+  html += '</div>';
+  if (multi) {
+    const others = S.analysis.results.filter((x) => x.module_name !== r.module_name);
+    html += '<div class="section dim">// other modules in file:</div>';
+    others.forEach((o) => {
+      const w = o.summary.total_warnings;
+      html += '<div>  <a href="#" class="mod-link" data-mod="' + esc(o.module_name) + '">' + esc(o.module_name) + '</a> ' +
+        '<span class="dim">' + plural((o.deadlocks || []).length, 'deadlock') + ', ' + plural(((o.reachability || {}).unreachable || []).length, 'unreachable', 'unreachable') + '</span> ' + tag(w ? 'WARN' : 'PASS') + '</div>';
+    });
+  }
+  body.innerHTML = html;
+  report.appendChild(body);
+  body.querySelectorAll('.fix-btn').forEach((b) => b.addEventListener('click', () => startFix(b.dataset.state)));
+  body.querySelectorAll('.mod-link').forEach((a) => a.addEventListener('click', (e) => {
+    e.preventDefault();
+    S.moduleName = a.dataset.mod;
+    renderSingle(true);
+  }));
+}
+
+async function renderBatch(animate) {
+  setLeftMode('batch');
+  $('module-select').classList.add('hidden');
+  $('diagram-module').textContent = S.file ? S.file.name : 'batch';
+  $('diagram-sub').textContent = '// batch analysis';
+  const d = S.analysis;
+  const sum = d.batch_summary || {};
+  const list = $('batch-list');
+  const rows = (d.results || []).map((f, i) => {
+    if (f.error) {
+      return '<div class="batch-row"><div class="row-main"><span class="dim">·</span><span>' + esc(f.filename) + '</span><span class="dim">—</span><span class="r">' + esc(f.error) + '</span><span></span>' + tag('ERROR') + '</div></div>';
+    }
+    const mods = f.modules || [];
+    const dl = mods.reduce((a, m) => a + (m.deadlocks || []).length, 0);
+    const un = mods.reduce((a, m) => a + (m.unreachable_states || []).length, 0);
+    const detail = mods.length ? mods.map((m) =>
+      '<div style="margin-bottom:8px"><span class="g">' + esc(m.module_name) + '</span> <span class="dim">confidence ' + esc(m.parse_confidence) + '% · ' + esc(m.states_found) + ' states · reset ' + esc(m.reset_state) + '</span>' +
+      (m.deadlocks || []).map((x) => '<div>  ' + tag('WARN') + ' deadlock <span class="g">' + esc(x.state) + '</span> <span class="sev-' + esc(x.severity) + '">' + esc(x.severity) + '</span> <span class="dim">' + esc(x.bug_pattern) + '</span><div class="dim" style="padding-left:9ch">condition: <span class="g">' + esc(x.condition) + '</span></div></div>').join('') +
+      (m.unreachable_states || []).map((s) => '<div>  ' + tag('WARN') + ' unreachable <span class="g">' + esc(s) + '</span></div>').join('') +
+      (!(m.deadlocks || []).length && !(m.unreachable_states || []).length ? '<div>  ' + tag('PASS') + ' no issues</div>' : '') +
+      '</div>').join('') : '<div class="dim">// no FSM modules found in this file</div>';
+    return '<div class="batch-row" data-i="' + i + '"><div class="row-main">' +
+      '<span class="dim caret">+</span><span>' + esc(f.filename) + '</span>' +
+      '<span class="dim">' + plural(mods.length, 'fsm') + '</span>' +
+      '<span class="' + (dl ? 'r' : 'dim') + '">' + plural(dl, 'deadlock') + '</span>' +
+      '<span class="' + (un ? 'o' : 'dim') + '">' + un + ' unreach.</span>' +
+      tag(dl || un ? 'WARN' : 'PASS') + '</div><div class="row-detail">' + detail + '</div></div>';
+  }).join('');
+  list.innerHTML = '<div class="term-line"><span class="dim">&gt;</span> batch analysis: <span class="g">' + plural(sum.files_analyzed || 0, 'file') + '</span></div><div style="margin-top:10px">' + rows + '</div>' +
+    '<div class="section">  total: <span class="' + (sum.total_deadlocks ? 'r' : 'g') + '">' + plural(sum.total_deadlocks || 0, 'deadlock') + '</span> across ' +
+    plural((d.results || []).filter((f) => (f.modules || []).some((m) => (m.deadlocks || []).length)).length, 'file') + '</div>';
+  list.querySelectorAll('.batch-row[data-i]').forEach((row) => row.querySelector('.row-main').addEventListener('click', () => {
+    row.classList.toggle('open');
+    row.querySelector('.caret').textContent = row.classList.contains('open') ? '-' : '+';
+  }));
+
+  const runId = S.runId;
+  const report = $('report');
+  report.innerHTML = '';
+  const lines = [
+    '<span class="dim">&gt;</span> unpacking <span class="g">' + esc(S.file ? S.file.name : 'archive.zip') + '</span>...',
+    '<span class="dim">&gt;</span> files analyzed: <span class="g">' + esc(sum.files_analyzed) + '</span>',
+    '<span class="dim">&gt;</span> fsms found: <span class="g">' + esc(sum.total_fsms_found) + '</span>',
+    '<span class="dim">&gt;</span> deadlocks: <span class="' + (sum.total_deadlocks ? 'r' : 'g') + '">' + esc(sum.total_deadlocks) + '</span>',
+    '<span class="dim">&gt;</span> unreachable states: <span class="' + (sum.total_unreachable_states ? 'o' : 'g') + '">' + esc(sum.total_unreachable_states) + '</span>',
+    '',
+    (sum.files_with_issues || []).length
+      ? tag('WARN') + ' files with issues: <span class="g">' + (sum.files_with_issues || []).map(esc).join(', ') + '</span>'
+      : tag('PASS') + ' no issues found across batch',
+    '<span class="dim">// click a row to expand per-module detail</span>',
+  ];
+  if (animate) await typeLines(report, lines, 100, runId);
+  else report.innerHTML = lines.map((l) => '<div class="term-line">' + (l || '&nbsp;') + '</div>').join('');
+}
+
+const VERDICT_CLS = { IMPROVED: 'g', REGRESSED: 'r', UNCHANGED: 'dim', MIXED: 'o' };
+async function renderCompare(animate) {
+  setLeftMode('compare');
+  $('module-select').classList.add('hidden');
+  $('diagram-module').textContent = (S.fileV1 ? S.fileV1.name : 'v1') + ' vs ' + (S.fileV2 ? S.fileV2.name : 'v2');
+  $('diagram-sub').textContent = '// version comparison';
+  const d = S.analysis;
+  const cs = d.comparison_summary || {};
+  const verdict = d.verdict || cs.verdict || 'UNCHANGED';
+  const vcls = VERDICT_CLS[verdict] || 'dim';
+  const v1w = (d.modules || []).reduce((a, m) => a + (m.v1_warnings || 0), 0);
+  const v2w = (d.modules || []).reduce((a, m) => a + (m.v2_warnings || 0), 0);
+
+  let per = '';
+  (d.modules || []).forEach((m) => {
+    const c = m.changes || {};
+    const entries = [];
+    (c.fixed || []).forEach((x) => entries.push('  <span class="g">' + pad(esc(x.state), 20) + '</span><span class="g">FIXED in v2</span>'));
+    (c.introduced || []).forEach((x) => entries.push('  <span class="g">' + pad(esc(x.state), 20) + '</span><span class="r">INTRODUCED in v2</span>'));
+    (c.unchanged || []).forEach((x) => entries.push('  <span class="g">' + pad(esc(x.state || x), 20) + '</span><span class="o">STILL PRESENT</span>'));
+    (c.added_states || []).forEach((s) => entries.push('  <span class="g">' + pad(esc(s), 20) + '</span><span class="b">state added</span>'));
+    (c.removed_states || []).forEach((s) => entries.push('  <span class="g">' + pad(esc(s), 20) + '</span><span class="dim">state removed</span>'));
+    per += '<div class="section"><span class="dim">module</span> <span class="g">' + esc(m.module_name) + '</span> ' +
+      '<span class="dim">v1: ' + plural(m.v1_warnings || 0, 'warning') + ' → v2: ' + plural(m.v2_warnings || 0, 'warning') + '</span></div>' +
+      (entries.length ? entries.map((e) => '<div class="term-line">' + e + '</div>').join('') : '<div class="dim">  // no changes</div>');
+  });
+  $('compare-view').innerHTML =
+    '<div class="term-line"><span class="dim">&gt;</span> comparing v1 vs v2...</div>' +
+    '<div class="section" style="font-size:18px">verdict: <span class="' + vcls + '" style="font-weight:700">' + esc(verdict) + (verdict === 'IMPROVED' ? ' ✓' : verdict === 'REGRESSED' ? ' ✗' : '') + '</span></div>' +
+    per;
+
+  const runId = S.runId;
+  const report = $('report');
+  report.innerHTML = '';
+  const lines = [
+    '<span class="dim">&gt;</span> v1: <span class="g">' + esc(S.fileV1 ? S.fileV1.name : '') + '</span>',
+    '<span class="dim">&gt;</span> v2: <span class="g">' + esc(S.fileV2 ? S.fileV2.name : '') + '</span>',
+    '<span class="dim">&gt;</span> bugs fixed: <span class="g">' + esc(cs.bugs_fixed || 0) + '</span>',
+    '<span class="dim">&gt;</span> bugs introduced: <span class="' + (cs.bugs_introduced ? 'r' : 'g') + '">' + esc(cs.bugs_introduced || 0) + '</span>',
+    '<span class="dim">&gt;</span> bugs unchanged: <span class="' + (cs.bugs_unchanged ? 'o' : 'g') + '">' + esc(cs.bugs_unchanged || 0) + '</span>',
+    '',
+    '  v1: ' + plural(v1w, 'warning') + '    v2: ' + plural(v2w, 'warning'),
+    cs.bugs_introduced ? '  ' + tag('WARN') + ' new issues introduced' : '  ' + tag('PASS') + ' no new issues introduced',
+    '',
+    'verdict: <span class="' + vcls + '">' + esc(verdict) + '</span>',
+  ];
+  if (animate) await typeLines(report, lines, 100, runId);
+  else report.innerHTML = lines.map((l) => '<div class="term-line">' + (l || '&nbsp;') + '</div>').join('');
+}
+
+async function exportPdf(errId) {
+  setErr(errId, '');
+  if (!S.file || S.mode !== 'single') return;
+  try {
+    const { blob, headers } = await api('/export/pdf', formFor(S.file), 'blob');
+    saveBlob(blob, filenameFromHeaders(headers, 'fsm_sentinel_report.pdf'));
+  } catch (e) { setErr(errId, errText(e)); }
+}
+$('export-pdf-btn').addEventListener('click', () => exportPdf('analysis-err'));
+$('done-pdf-btn').addEventListener('click', () => exportPdf('done-err'));
+
+// ------------------------------------------------------------------ page 3: fix
+function startFix(state) {
+  S.fixState = state;
+  S.fixModule = S.moduleName;
+  show('page-fix');
+  renderFixView(true);
+}
+
+function parseUnifiedDiff(diff) {
+  const rows = [];
+  let o = 0, n = 0;
+  (diff || '').split('\n').forEach((line) => {
+    if (line.startsWith('---') || line.startsWith('+++')) return;
+    const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (h) { o = +h[1]; n = +h[2]; rows.push({ kind: 'hunk', text: line }); return; }
+    if (line.startsWith('+')) rows.push({ kind: 'add', o: '', n: n++, text: line.slice(1) });
+    else if (line.startsWith('-')) rows.push({ kind: 'del', o: o++, n: '', text: line.slice(1) });
+    else if (line.startsWith('\\')) return;
+    else if (line.length || rows.length) rows.push({ kind: 'ctx', o: o++, n: n++, text: line.slice(1) });
+  });
+  while (rows.length && rows[rows.length - 1].kind === 'ctx' && !rows[rows.length - 1].text.trim()) rows.pop();
+  return rows;
+}
+
+function currentFixEntry() {
+  if (!S.fix) return null;
+  const mr = (S.fix.results || []).find((r) => r.module_name === S.fixModule);
+  if (!mr) return null;
+  const fx = (mr.fixes_applied || []).find((f) => f.state === S.fixState) || null;
+  return { module: mr, fix: fx };
+}
+
+async function renderFixView(animate) {
+  const runId = S.runId;
+  setErr('fix-err', '');
+  const log = $('fix-log');
+  log.innerHTML = '';
+  ['diff-label', 'diff', 'fix-desc'].forEach((id) => $(id).classList.add('hidden'));
+  $('apply-fix-btn').disabled = true;
+
+  const head = [
+    '<span class="dim">&gt;</span> generating fix for <span class="g">' + esc(S.fixState) + '</span>' + (S.fixModule ? ' <span class="dim">(module ' + esc(S.fixModule) + ')</span>' : '') + '...',
+  ];
+  if (animate) await typeLines(log, head, 100, runId); else log.innerHTML = head.map((l) => '<div class="term-line">' + l + '</div>').join('');
+  if (runId !== S.runId) return;
+
+  if (!S.fix) {
+    const spin = document.createElement('div');
+    spin.className = 'term-line dim';
+    spin.textContent = '[ANALYZING...]';
+    log.appendChild(spin);
+    try {
+      S.fix = await api('/fix', formFor(S.file));
+      S.fixedContent = S.fix.fixed_file_content || null;
+      S.fixedViz = null;
+    } catch (e) {
+      spin.remove();
+      setErr('fix-err', errText(e));
+      return;
+    }
+    spin.remove();
+    if (runId !== S.runId) return;
+  }
+
+  const entry = currentFixEntry();
+  if (!entry || !entry.fix) {
+    setErr('fix-err', '[ERROR] backend returned no fix for ' + S.fixState);
+    return;
+  }
+  const desc = entry.fix.fix_description || '';
+  const provider = /template/i.test(desc) ? 'template fallback' : /anthropic|claude/i.test(desc) ? 'anthropic' : /groq|llama/i.test(desc) ? 'groq' : 'groq / template fallback';
+  const strategy = /timeout|== ?15/i.test(desc) || /==\s*15/.test(entry.fix.diff) ? 'add timeout escape (== 15 counter pattern)' : desc;
+  const more = [
+    '<span class="dim">&gt;</span> fix strategy: <span class="g">' + esc(strategy) + '</span>',
+    '<span class="dim">&gt;</span> provider: <span class="g">' + esc(provider) + '</span>',
+  ];
+  if (animate) await typeLines(log, more, 100, runId); else more.forEach((l) => { const d = document.createElement('div'); d.className = 'term-line'; d.innerHTML = l; log.appendChild(d); });
+  if (runId !== S.runId) return;
+
+  const rows = parseUnifiedDiff(entry.fix.diff);
+  $('diff-label').innerHTML = '<span class="g">' + esc(S.fixState) + '</span> <span class="dim">— original → fixed</span>';
+  $('diff').innerHTML = '<table>' + rows.map((r) => {
+    if (r.kind === 'hunk') return '<tr class="hunk"><td class="ln"></td><td class="ln"></td><td class="code">' + esc(r.text) + '</td></tr>';
+    const sign = r.kind === 'add' ? '+' : r.kind === 'del' ? '-' : ' ';
+    return '<tr class="' + r.kind + '"><td class="ln">' + r.o + '</td><td class="ln">' + r.n + '</td><td class="code">' + sign + ' ' + esc(r.text) + '</td></tr>';
+  }).join('') + '</table>';
+  $('fix-desc').textContent = '// ' + desc;
+  ['diff-label', 'diff', 'fix-desc'].forEach((id) => $(id).classList.remove('hidden'));
+  $('apply-fix-btn').disabled = false;
+}
+
+$('apply-fix-btn').addEventListener('click', () => {
+  show('page-verify');
+  renderVerify(true);
+});
+
+// ------------------------------------------------------------------ page 4: verify
+function fixedFilename() {
+  return stem(S.file ? S.file.name : 'design.v') + '_fixed' + (ext(S.file && S.file.name) || '.v');
+}
+
+async function renderVerify(animate) {
+  const runId = S.runId;
+  setErr('verify-err', '');
+  const log = $('verify-log');
+  log.innerHTML = '';
+  $('verify-actions').classList.toggle('hidden', animate);
+  $('verify-module').textContent = S.fixModule;
+  const entry = currentFixEntry();
+  if (!entry) { setErr('verify-err', '[ERROR] no fix available. go back and generate one'); $('verify-actions').classList.remove('hidden'); return; }
+
+  // draw the pre-fix diagram first so the deadlock node can transition
+  const container = $('diagram-verify');
+  const handle = renderDiagram(container, vizFor(S.viz, S.fixModule));
+
+  const fname = fixedFilename();
+  const pre = [
+    '<span class="dim">&gt;</span> applying fix to <span class="g">' + esc(S.fixState) + '</span>...',
+    '<span class="dim">&gt;</span> fix applied. re-running analysis...',
+    '<span class="dim">&gt;</span> parsing <span class="g">' + esc(fname) + '</span>...',
+  ];
+  if (animate) { if (!(await typeLines(log, pre, 150, runId))) return; }
+  else log.innerHTML = pre.map((l) => '<div class="term-line">' + l + '</div>').join('');
+
+  // Re-verify independently: send fixed content back through /analyze + /visualize.
+  let reAnalysis = null;
+  try {
+    if (!S.fixedViz && S.fixedContent) {
+      const f = new File([S.fixedContent], fname, { type: 'text/plain' });
+      const [a, v] = await Promise.all([api('/analyze', formFor(f)), api('/visualize', formFor(f))]);
+      S.fixedAnalysis = a; S.fixedViz = v;
+    }
+    reAnalysis = S.fixedAnalysis ? (S.fixedAnalysis.results || []).find((r) => r.module_name === S.fixModule) : null;
+  } catch (e) {
+    setErr('verify-err', errText(e));
+  }
+  if (runId !== S.runId) return;
+
+  const ver = entry.module.verification || {};
+  const statesFound = reAnalysis ? reAnalysis.states_found : (resultFor(S.fixModule) || {}).states_found;
+  const unreach = reAnalysis ? (reAnalysis.reachability.unreachable || []) : [];
+  const dls = reAnalysis ? (reAnalysis.deadlocks || []) : [];
+  const warnings = reAnalysis ? reAnalysis.summary.total_warnings : ver.warnings_after;
+  const passed = warnings === 0 && ver.status !== 'fail';
+  const post = [
+    '<span class="dim">&gt;</span> states found: <span class="g">' + esc(statesFound) + '</span>',
+    '<span class="dim">&gt;</span> checking reachability... ' + (unreach.length ? tag('WARN') + ' <span class="o">' + unreach.map(esc).join(', ') + '</span>' : tag('PASS')),
+    '<span class="dim">&gt;</span> checking deadlocks...    ' + (dls.length ? tag('WARN') + ' <span class="r">' + dls.map((d) => esc(d.state)).join(', ') + '</span>' : tag('PASS')),
+    '<span class="dim">&gt;</span> warnings: <span class="' + (warnings ? 'o' : 'g') + '">' + esc(warnings) + '</span>',
+    '&nbsp;',
+    passed
+      ? '<div class="pass-banner">' + tag('PASS') + ' all checks passed. 0 warnings remaining.</div>'
+      : '<div class="fail-banner">' + tag('WARN') + ' ' + plural(warnings || 0, 'warning') + ' remaining in ' + esc(S.fixModule) + '.</div>',
+  ];
+  const otherMods = (S.fix.results || []).filter((r) => r.module_name !== S.fixModule);
+  if (otherMods.length) {
+    post.push('&nbsp;');
+    otherMods.forEach((m) => {
+      const w = (m.verification || {}).warnings_after || 0;
+      post.push('<span class="dim">// module ' + esc(m.module_name) + ': untouched, ' + plural(w, 'pre-existing warning') + '</span>');
+    });
+  }
+  if (animate) { if (!(await typeLines(log, post, 150, runId))) return; }
+  else post.forEach((l) => { const d = document.createElement('div'); d.className = 'term-line'; d.innerHTML = l; log.appendChild(d); });
+
+  // transition diagram: fixed state goes red -> grey (800ms CSS transition)
+  if (handle) {
+    const newViz = vizFor(S.fixedViz, S.fixModule);
+    const newType = new Map(((newViz && newViz.nodes) || []).map((n) => [n.id, n.type]));
+    handle.nodes.each(function (d) {
+      const t = newType.get(d.id);
+      if (d.type === 'deadlock' && (t === undefined ? passed : t !== 'deadlock')) {
+        d3.select(this).classed('resolved', true).select('title').text(d.label + '  [resolved]');
+      }
+    });
+  }
+  S.verifyPassed = passed;
+  if (animate) await sleep(800);
+  if (runId !== S.runId) return;
+  $('verify-actions').classList.remove('hidden');
+}
+
+$('download-btn').addEventListener('click', async () => {
+  setErr('verify-err', '');
+  const btn = $('download-btn');
+  btn.disabled = true;
+  try {
+    const { blob, headers } = await api('/download', formFor(S.file), 'blob');
+    S.fixedFilename = filenameFromHeaders(headers, fixedFilename());
+    saveBlob(blob, S.fixedFilename);
+    show('page-done');
+    renderDone();
+  } catch (e) {
+    setErr('verify-err', errText(e));
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ------------------------------------------------------------------ page 5: done
+function renderDone() {
+  setErr('done-err', '');
+  const entry = currentFixEntry();
+  const before = (resultFor(S.fixModule) || {}).deadlocks || [];
+  const after = S.fixedAnalysis ? (((S.fixedAnalysis.results || []).find((r) => r.module_name === S.fixModule) || {}).deadlocks || []) : [];
+  const rows = entry && entry.fix ? parseUnifiedDiff(entry.fix.diff) : [];
+  const changed = rows.filter((r) => r.kind === 'add' || r.kind === 'del').length;
+  const others = S.fix ? (S.fix.results || []).filter((r) => r.module_name !== S.fixModule).length : 0;
+  $('done-pdf-btn').classList.toggle('hidden', !S.file);
+  $('done-log').innerHTML = '<div class="term-line"><span class="dim">&gt;</span> <span class="g">' + esc(S.fixedFilename || fixedFilename()) + '</span> downloaded.</div>';
+  $('done-summary').innerHTML =
+    '<div class="kv">' +
+      '<span class="k">before:</span><span>' + pad(plural(before.length, 'deadlock'), 13) + (before.length ? tag('WARN') : tag('PASS')) + '</span>' +
+      '<span class="k">after:</span><span>' + pad(plural(after.length, 'deadlock'), 13) + (after.length ? tag('WARN') : tag('PASS')) + '</span>' +
+    '</div><div style="height:14px"></div><div class="kv">' +
+      '<span class="k">module:</span><span class="g">' + esc(S.fixModule) + '</span>' +
+      '<span class="k">fix applied to:</span><span class="g">' + esc(S.fixState) + '</span>' +
+      '<span class="k">lines changed:</span><span class="g">' + changed + '</span>' +
+      '<span class="k">other states:</span><span class="g">untouched</span>' +
+      (others ? '<span class="k">other modules:</span><span class="g">' + others + ' untouched</span>' : '') +
+    '</div>';
+}
+
+// ------------------------------------------------------------------ global safety net
+window.addEventListener('error', (e) => {
+  const target = { 'page-upload': 'upload-err', 'page-analysis': 'analysis-err', 'page-fix': 'fix-err', 'page-verify': 'verify-err', 'page-done': 'done-err' }[S.current];
+  if (target) setErr(target, '[ERROR] ' + (e.message || 'unexpected error'));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const target = { 'page-upload': 'upload-err', 'page-analysis': 'analysis-err', 'page-fix': 'fix-err', 'page-verify': 'verify-err', 'page-done': 'done-err' }[S.current];
+  if (target) setErr(target, errText(e.reason));
+  e.preventDefault();
+});
+window.addEventListener('resize', () => { if (diagramHandle && S.current === 'page-analysis') diagramHandle.fit(); });
+
+if (typeof d3 === 'undefined') {
+  setErr('upload-err', '[ERROR] failed to load d3.js from cdnjs. check network connection');
+}
+pingBackend();
+})();
+</script>
+</body>
+</html>

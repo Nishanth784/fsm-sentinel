@@ -17,8 +17,9 @@ Confidence scoring (compute_confidence): BUILT/VALIDATED
 PDF export (/export/pdf): BUILT/VALIDATED
 Bug pattern classification (classify_bug_pattern): BUILT/VALIDATED
 Webhook support (webhook_url on /analyze and /analyze/batch): BUILT/VALIDATED
-Last updated by: Claude Code
-Last updated at: 2026-09-21T12:08:44Z
+frontend/index.html: BUILT/VALIDATED — single-file UI (HTML+CSS+JS, D3 v7.8.5 from cdnjs, JetBrains Mono), no build step; open directly in a browser with the backend on :8000. 5-page flow upload -> analysis (layered left-to-right state diagram + report) -> fix diff -> verification (fixed content re-sent through /analyze + /visualize) -> download summary; plus .zip batch view and v1/v2 compare view. Verified end-to-end against axi_master.v in Chrome via Playwright: wdata_last pulses red, /fix diff renders, post-fix re-analysis 0 warnings for axi_master, axi_master_fixed.v downloads, Back works on every page, 0 console errors. See frontend/README.md
+Last updated by: Devin (frontend)
+Last updated at: 2026-09-25T10:45:00Z
 
 ## ARCHITECTURE DECISIONS
 - Parser uses Python re only — no third party Verilog libraries
@@ -451,13 +452,13 @@ just axi_master.
 [x] Add webhook_url support (BackgroundTasks + httpx) to /analyze and /analyze/batch — Claude Code
 [x] Add TEST 15-21, all 21 tests passing — Claude Code
 [x] Re-verify CLI commands (axi_master.v, axi_master.v --fix, unreachable_fsm.v) unchanged in substance after all of the above — Claude Code
-[ ] Build web UI — Devin
-[ ] Build state diagram visualizer — consume POST /visualize's
-    `modules[].{nodes,edges,metadata}` (D3 force-directed graph; node
+[x] Build web UI — Devin
+[x] Build state diagram visualizer — consume POST /visualize's
+    `modules[].{nodes,edges,metadata}` (D3, layered left-to-right layout, not force-directed; node
     `type` drives color, deadlock nodes carry `severity`) — Devin
-[ ] Diff viewer (UI) — consume /fix's `results[].fixes_applied[].diff` — Devin
-[ ] Download button — wire to POST /download — Devin
-[ ] Polish output formatting — Devin
+[x] Diff viewer (UI) — consume /fix's `results[].fixes_applied[].diff` — Devin
+[x] Download button — wire to POST /download — Devin
+[x] Polish output formatting — Devin
 [ ] Wire a real GROQ_API_KEY or ANTHROPIC_API_KEY in the deployed
     environment and confirm the live-LLM fix path (not just the
     template fallback) — whoever owns the demo environment, since
@@ -467,13 +468,13 @@ just axi_master.
     auto-fix unreachability, only deadlocks) — whoever owns the demo
     script, since it'll show up as a real, correctly-reported warning
     if axi4_slave is included in the demo
-[ ] Batch upload UI — wire to POST /analyze/batch (multi-file drag/drop,
+[x] Batch upload UI — wire to POST /analyze/batch (multi-file drag/drop,
     consolidated results table) — Devin
-[ ] Version-diff UI — wire to POST /compare (two-file upload, verdict
+[x] Version-diff UI — wire to POST /compare (two-file upload, verdict
     badge, fixed/introduced/unchanged lists, added/removed states) — Devin
-[ ] "Download PDF report" button — wire to POST /export/pdf — Devin
-[ ] Show parse_confidence % somewhere in the module header/card in the UI — Devin
-[ ] Show bug_pattern + pattern_description on deadlock cards/nodes — Devin
+[x] "Download PDF report" button — wire to POST /export/pdf — Devin
+[x] Show parse_confidence % somewhere in the module header/card in the UI — Devin
+[x] Show bug_pattern + pattern_description on deadlock cards/nodes — Devin
 [ ] CI/CD integration docs — document webhook_url usage for pipeline
     integration (POST /analyze?webhook_url=... or /analyze/batch) —
     whoever writes user-facing docs
