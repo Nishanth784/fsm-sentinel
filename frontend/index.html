@@ -848,6 +848,49 @@ function chatLine(cls, text) {
   thread.scrollTop = thread.scrollHeight;
   return div;
 }
+function mdToPlain(md) {
+  const out = [];
+  let table = [];
+  let inCode = false;
+  const flushTable = () => {
+    if (!table.length) return;
+    const widths = [];
+    table.forEach((r) => r.forEach((c, i) => { widths[i] = Math.max(widths[i] || 0, c.length); }));
+    if (widths.reduce((a, w) => a + w + 3, 0) <= 100) {
+      table.forEach((r) => out.push(r.map((c, i) => c.padEnd(widths[i])).join('   ').trimEnd()));
+    } else {
+      const [head, ...rows] = table;
+      rows.forEach((r) => {
+        out.push(r[0] || '');
+        r.slice(1).forEach((c, i) => out.push('  ' + (head[i + 1] ? head[i + 1] + ': ' : '') + c));
+        out.push('');
+      });
+    }
+    table = [];
+  };
+  const inline = (t) => t
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/!?\[([^\]]*)\]\(([^)]*)\)/g, '$1 ($2)')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/(\*\*|__)(.+?)\1/g, '$2')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,:;!?]|$)/g, '$1$2')
+    .replace(/(^|[\s(])_([^_\s][^_]*?)_(?=[\s).,:;!?]|$)/g, '$1$2');
+  for (const raw of String(md).replace(/\r\n?/g, '\n').split('\n')) {
+    if (/^\s*```/.test(raw)) { flushTable(); inCode = !inCode; continue; }
+    if (inCode) { out.push(raw); continue; }
+    if (/^\s*\|.*\|/.test(raw)) {
+      if (/^\s*\|?[\s:|-]+\|?\s*$/.test(raw)) continue;
+      table.push(raw.trim().replace(/^\||\|$/g, '').split('|').map((c) => inline(c.trim())));
+      continue;
+    }
+    flushTable();
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(raw)) { out.push(''); continue; }
+    out.push(inline(raw.replace(/^(\s*)#{1,6}\s+/, '$1').replace(/^(\s*)[*+]\s+/, '$1- ').replace(/^(\s*)>\s?/, '$1')));
+  }
+  flushTable();
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 async function typeChars(el, text, delay) {
   const thread = $('chat-thread');
   el.textContent = '';
@@ -869,7 +912,7 @@ $('chat-form').addEventListener('submit', async (ev) => {
   try {
     const res = await api('/chat', { analysis: S.analysis, message });
     pending.className = 'chat-msg assistant';
-    await typeChars(pending, String(res.reply || ''), 11);
+    await typeChars(pending, mdToPlain(res.reply || ''), 11);
   } catch (e) {
     pending.className = 'chat-msg err';
     pending.textContent = errText(e);
