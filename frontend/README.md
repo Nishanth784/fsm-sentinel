@@ -30,3 +30,19 @@ Batch (`.zip`) uses `POST /analyze/batch`; compare uses `POST /compare`.
 ## Demo check
 
 Upload `axi_master.v` → `axi_master` shows `wdata_last` pulsing red, 1 deadlock, HIGH severity → Fix This → Apply Fix → `[PASS] all checks passed. 0 warnings remaining.`
+
+## Vite build / Vercel
+
+The page also builds with Vite so it can be hosted statically:
+
+```bash
+cd frontend
+npm install
+VITE_API_URL=https://fsm-sentinel.onrender.com npm run build   # -> dist/
+```
+
+`VITE_API_URL` is injected into `<meta name="api-url">` at build time. Resolution order:
+`?api=` query param, then `VITE_API_URL`, then `http://localhost:8000`.
+
+Vercel: Root Directory `frontend`, Framework Preset `Vite`, Build Command `npm run build`,
+Output Directory `dist`, env `VITE_API_URL=https://fsm-sentinel.onrender.com`.

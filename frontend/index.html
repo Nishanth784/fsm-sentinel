@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<meta name="api-url" content="%VITE_API_URL%">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <style>
 :root {
@@ -353,8 +354,13 @@ svg.focus .edge.hl text { opacity: 1; fill: var(--green); }
 (function () {
 'use strict';
 
-const API = (new URLSearchParams(location.search).get('api') || 'http://localhost:8000').replace(/\/$/, '');
-const BACKEND_DOWN = '[ERROR] backend not running. start: uvicorn api:app --port 8000';
+const BUILD_API = (document.querySelector('meta[name="api-url"]') || {}).content || '';
+const API = (new URLSearchParams(location.search).get('api')
+  || (BUILD_API && !BUILD_API.startsWith('%') ? BUILD_API : '')
+  || 'http://localhost:8000').replace(/\/$/, '');
+const BACKEND_DOWN = /\/\/(localhost|127\.0\.0\.1)[:/]/.test(API + '/')
+  ? '[ERROR] backend not running. start: uvicorn api:app --port 8000'
+  : '[ERROR] backend unreachable at ' + API + ' (it may be waking up — retry in ~30s)';
 const ACCEPTED = ['.v', '.sv', '.zip'];
 
 // ------------------------------------------------------------------ state
