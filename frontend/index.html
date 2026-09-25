@@ -234,7 +234,7 @@ svg.focus .edge.hl text { opacity: 1; fill: var(--green); }
     <div id="single-mode">
       <div class="dropzone" id="dz-main" tabindex="0">
         <div class="dz-title">Drop your Verilog file here</div>
-        <div class="dz-types">.v &nbsp;.sv &nbsp;.zip</div>
+        <div class="dz-types">.v &nbsp;.sv &nbsp;.txt &nbsp;.zip</div>
         <button class="btn" type="button" data-browse="main">[ Browse Files ]</button>
         <div class="dz-file" id="dz-main-file"></div>
       </div>
@@ -257,9 +257,9 @@ svg.focus .edge.hl text { opacity: 1; fill: var(--green); }
       </div>
     </div>
 
-    <input type="file" id="file-main" accept=".v,.sv,.zip" class="hidden">
-    <input type="file" id="file-v1" accept=".v,.sv" class="hidden">
-    <input type="file" id="file-v2" accept=".v,.sv" class="hidden">
+    <input type="file" id="file-main" accept=".v,.sv,.txt,.zip" class="hidden">
+    <input type="file" id="file-v1" accept=".v,.sv,.txt" class="hidden">
+    <input type="file" id="file-v2" accept=".v,.sv,.txt" class="hidden">
 
     <button class="btn primary" id="analyze-btn" type="button">[ Analyze ]</button>
     <button class="btn primary hidden" id="compare-btn" type="button">[ Compare ]</button>
@@ -384,7 +384,7 @@ const API = (new URLSearchParams(location.search).get('api')
 const BACKEND_DOWN = /\/\/(localhost|127\.0\.0\.1)[:/]/.test(API + '/')
   ? '[ERROR] backend not running. start: uvicorn api:app --port 8000'
   : '[ERROR] backend unreachable at ' + API + ' (it may be waking up — retry in ~30s)';
-const ACCEPTED = ['.v', '.sv', '.zip'];
+const ACCEPTED = ['.v', '.sv', '.txt', '.zip'];
 
 // ------------------------------------------------------------------ state
 const S = {
@@ -407,6 +407,7 @@ function esc(s) {
 }
 function ext(name) { const m = /\.[^.]+$/.exec(name || ''); return m ? m[0].toLowerCase() : ''; }
 function stem(name) { return (name || 'design.v').replace(/\.[^.]+$/, ''); }
+function uploadName(name) { return ext(name) === '.txt' ? stem(name) + '.v' : name; }
 function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
 function pad(s, n) { s = String(s); return s.length >= n ? s + ' ' : s + ' '.repeat(n - s.length); }
 function tag(kind) {
@@ -446,7 +447,7 @@ async function api(path, form, as) {
 }
 function formFor(file, name) {
   const fd = new FormData();
-  fd.append(name || 'file', file, file.name);
+  fd.append(name || 'file', file, uploadName(file.name));
   return fd;
 }
 function errText(e) {
@@ -523,7 +524,7 @@ document.querySelectorAll('[data-reset]').forEach((b) => b.addEventListener('cli
 function setFile(slot, file) {
   setErr('upload-err', '');
   if (!file) return;
-  const allowed = slot === 'main' ? ACCEPTED : ['.v', '.sv'];
+  const allowed = slot === 'main' ? ACCEPTED : ['.v', '.sv', '.txt'];
   if (!allowed.includes(ext(file.name))) {
     setErr('upload-err', '[ERROR] unsupported file type. accepted: ' + allowed.join(' '));
     return;
@@ -563,7 +564,7 @@ $('toggle-compare').addEventListener('click', () => setCompareOpen(!S.compareOpe
 
 $('analyze-btn').addEventListener('click', async () => {
   setErr('upload-err', '');
-  if (!S.file) { setErr('upload-err', '[ERROR] no file selected. drop a .v .sv or .zip file'); return; }
+  if (!S.file) { setErr('upload-err', '[ERROR] no file selected. drop a .v .sv .txt or .zip file'); return; }
   const btn = $('analyze-btn');
   btn.disabled = true; btn.textContent = '[ANALYZING...]';
   try {
@@ -601,8 +602,8 @@ $('compare-btn').addEventListener('click', async () => {
   btn.disabled = true; btn.textContent = '[ANALYZING...]';
   try {
     const fd = new FormData();
-    fd.append('file_v1', S.fileV1, S.fileV1.name);
-    fd.append('file_v2', S.fileV2, S.fileV2.name);
+    fd.append('file_v1', S.fileV1, uploadName(S.fileV1.name));
+    fd.append('file_v2', S.fileV2, uploadName(S.fileV2.name));
     S.mode = 'compare';
     S.analysis = await api('/compare', fd);
     show('page-analysis');
@@ -1240,7 +1241,7 @@ $('apply-fix-btn').addEventListener('click', () => {
 
 // ------------------------------------------------------------------ page 4: verify
 function fixedFilename() {
-  return stem(S.file ? S.file.name : 'design.v') + '_fixed' + (ext(S.file && S.file.name) || '.v');
+  return stem(S.file ? S.file.name : 'design.v') + '_fixed' + (ext(uploadName(S.file && S.file.name)) || '.v');
 }
 
 async function renderVerify(animate) {
